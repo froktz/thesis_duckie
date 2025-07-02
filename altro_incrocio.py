@@ -35,19 +35,7 @@ def moving_average(x, w):
     x = np.array(x).flatten()
     return np.convolve(x, np.ones(w), 'valid') / w
 
-def left_turn_available(env):
-    # Coordinate attuali del robot
-    x, y, z = env.cur_pos
-    i = int(np.floor(x))
-    j = int(np.floor(z))
 
-    tile = env.unwrapped._get_tile(i, j)
-    if tile is None:
-        return False
-
-    tile_kind = tile['kind']
-    # Lista dei tipi di incrocio che ammettono svolta a sinistra
-    return tile_kind in ['4way', '3way_left', 'curve_left']
 
 class DuckieRLWrapper(gym.Env):
 
@@ -55,39 +43,35 @@ class DuckieRLWrapper(gym.Env):
         super(DuckieRLWrapper, self).__init__()
         self.env = env
 
-        # Lista delle posizioni iniziali possibili (posizione, angolo)
-        self.possible_starts = [
-            (np.array([1.85313356, 0., 1.5687472]), -0.06229765469565894),
-            (np.array([1.35389949, 0., 1.89896477]), -1.6180560830233601),
-            (np.array([0.69820322, 0., 1.5677339]), -0.028414341288794793),
-            (np.array([0.2134203, 0., 0.60191441]), -1.5570214445017387),
-            (np.array([0.72964605, 0., 1.56071875]), -0.21878014687120712),
-            (np.array([1.9739118, 0., 1.60418237]), 0.018816033774968922),
-            (np.array([1.61513161, 0., 2.01799389]), 1.5476869500965005),
-            (np.array([1.64426201, 0., 0.75767361]), 1.5476869500965005),
-            (np.array([1.58126874, 0., 2.19177157]), 1.5289606578796389),
-            (np.array([1.84308267, 0., 1.51558419]), 0.04482048222269934),
-            (np.array([2.14962907, 0., 0.20062444]), 3.088490894742158)
-            ]
-        
+                # Lista delle posizioni iniziali possibili (posizione, angolo)
+        # self.possible_starts = [
+            #(np.array([1.85313356, 0., 1.5687472]), -0.06229765469565894),
+            #(np.array([1.35389949, 0., 1.89896477]), -1.6180560830233601),
+            #(np.array([0.69820322, 0., 1.5677339]), -0.028414341288794793),
+            #(np.array([0.2134203, 0., 0.60191441]), -1.5570214445017387),
+            #(np.array([0.72964605, 0., 1.56071875]), -0.21878014687120712),
+            #(np.array([1.9739118, 0., 1.60418237]), 0.018816033774968922),
+            #(np.array([1.61513161, 0., 2.01799389]), 1.5476869500965005),
+            #(np.array([1.64426201, 0., 0.75767361]), 1.5476869500965005),
+            #(np.array([1.58126874, 0., 2.19177157]), 1.5289606578796389),
+            #(np.array([1.84308267, 0., 1.51558419]), 0.04482048222269934),
+            #(np.array([2.14962907, 0., 0.20062444]), 3.088490894742158)
+            #]
+
         self.oscillation_count = 0
         self.last_action = None
 
         # Per il tracking del movimento verso la goal
         self.last_pos = None
 
-        # Per gestire il centro della goal_region
-        self.goal_points = None
-        self.goal_region = lambda pos, angle: False  # placeholder
-
         # modificato dimensione da (480, 680, 3) per ridurre il carico computazionale
 
         # hybrid observation: image  + vector features
         self.observation_space = spaces.Box(
-            low=np.array([-1., -np.pi, 0.]),
-            high=np.array([1., np.pi, 1.]),
+            low=np.array([-1., -np.pi, 0.,   0.]), 
+            high=np.array([ 1.,  np.pi, 1.,   2.]),  # 2 = due tile di distanza massima
             dtype=np.float32
-            )
+        )
         self.action_space = spaces.Discrete(7)  # Azioni: sinistra, dritto, destra (per semplificare)
 
         # possibile implementazione in spazio continuo
@@ -96,240 +80,300 @@ class DuckieRLWrapper(gym.Env):
         self.last_action = None
         self.oscillation_count = 0
 
+        self.offroad_counter = 0
+        self.offroad_max = 5   # numero di step consecutivi tollerati fuori strada
+
+        self.prev_tile = None
+        self.curr_tile = None
+        self.left_turn_allowed = False
+        self.last_obs = None
+
+        self.current_tile_kind = None  # Inizializza a None o un valore di default appropriato
+        self.current_left_turn_result = True # Inizializza a True come default
+        self.current_delta_tile_movement = None # Inizializza a None
+
     def seed(self, seed=None):
         return self.env.seed(seed)
-
-    def generate_goal_region_from_start(self, start_pos, start_angle, dist=0.8, width=0.2, height=0.2):
-        import numpy as np
-        # x, _, z = start_pos
-        x, _, z = start_pos[:3]  # Assicurati di usare solo x e z
-        forward_dir = np.array([np.cos(start_angle), np.sin(start_angle)])
-        goal_center = np.array([x, z]) + dist * forward_dir
-
-        dx = width / 2
-        dz = height / 2
-        p1 = goal_center + [-dx, -dz]
-        p2 = goal_center + [dx, -dz]
-        p3 = goal_center + [dx, dz]
-        p4 = goal_center + [-dx, dz]
-
-        return [np.array([p[0], 0, p[1]]) for p in [p1, p2, p3, p4]]
-
-    def create_goal_region_function(self, goal_points):
-        from shapely.geometry import Point, Polygon
-
-        poly_2d = Polygon([(p[0], p[2]) for p in goal_points])
-
-        def is_in_goal(pos, angle):
-            pt = Point(pos[0], pos[2])
-            return poly_2d.contains(pt)
-
-        return is_in_goal
-
-    def _get_tile_from_pos(self, pos):
+    
+    
+    def left_turn_available(self, prev, curr):
         """
-        Calcola la tile (x, y) a partire dalla posizione globale.
+        Determina se la svolta a sinistra è disponibile nell'incrocio corrente,
+        in base alla tile di provenienza e al tipo di incrocio.
         """
-        tile_size = self.env.road_tile_size
-        return tuple(np.floor(np.array(pos)[:2] / tile_size).astype(int))
+
+        # prev = getattr(self, "prev_tile", None)
+        # curr = getattr(self, "curr_tile", None)
+        # if prev is None or curr is None:
+            # return False
+        
+        prev_i, prev_j = prev
+        curr_i, curr_j = curr
+        # delta = (curr_i - prev_i, curr_j - prev_j)
+
+        # tile_type si può prendere da curr_tile_info se lo salvi, ad esempio:
+        # tile_info = self.env.unwrapped._map_tile_dict.get(curr, None)
+        # tile_type = tile_info["kind"] if tile_info else None
+
+        # i, j = self.env.unwrapped.get_grid_coords(self.env.unwrapped.curr)
+        # 'curr' è già la tupla (i, j) che rappresenta la tile corrente
+        curr_i, curr_j = curr
+        tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type = tile_type1["kind"] if tile_info else None
+
+
+        # Se siamo in una 4-way, la svolta a sinistra è sempre disponibile
+        if tile_type == "4way":
+            return True, (curr_i - prev_i, curr_j - prev_j)
+        elif tile_type == "3way_left":
+            # Regole per 3-way sinistra — svolta possibile solo da certe direzioni
+            valid_entries_for_left_turn = {
+                (2, 0): (3, 0),  # da sud
+                (2, 4): (1, 4),  # da est
+                (4, 2): (3, 2),  # da nord
+                (0, 2): (1, 2),  # da ovest
+                (0, 2): (0, 1),
+                (4, 2): (4, 3),
+                (2, 0): (2, 1), 
+                (2, 4): (2, 3)
+            }
+
+            if curr in valid_entries_for_left_turn:
+                return prev == valid_entries_for_left_turn[curr], (curr_i - prev_i, curr_j - prev_j)
+            else:
+                # Se non è una direzione valida per la svolta a sinistra, non è permessa
+                return False, None
+        else:
+            # In altri casi la svolta non è permessa
+            return False, None
+
 
     def stop_line_detected(self, img):
-        # img: la stessa immagine ridimensionata da passare all'agente
-
-        # Converti in scala di grigi
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-        # Equalizzazione per condizioni di luce variabili
-        gray = cv2.equalizeHist(gray)
-
-        # Canny edge detection
-        edges = cv2.Canny(gray, 100, 200)
+        hsv   = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        # rosso chiaro in Duckietown
+        lower = np.array([0, 100, 100])
+        upper = np.array([10, 255, 255])
+        mask1 = cv2.inRange(hsv, lower, upper)
+        lower = np.array([160, 100, 100])
+        upper = np.array([180, 255, 255])
+        mask2 = cv2.inRange(hsv, lower, upper)
+        mask  = cv2.bitwise_or(mask1, mask2)
+        # ROI in basso (davanti al robot)
+        h, w = mask.shape
+        roi   = mask[int(h*0.6):h, int(w*0.2):int(w*0.8)]
+        return cv2.countNonZero(roi) > (roi.size * 0.05)
         
-        # cerca linee orizzontali via HoughLinesP
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=50, maxLineGap=10)
-        if lines is None: 
-            return False
-        h, w = img.shape[:2]
-        
-        for x1, y1, x2, y2 in lines[:, 0]:
-            # Cerca linee orizzontali abbastanza lunghe nella parte bassa dell'immagine
-            if abs(y1 - y2) < 8 and abs(x2 - x1) > w * 0.5 and min(y1, y2) > h * 0.6:
-                return True
-        return False
-    
-    # def get_goal_tile(self, position, angle):
-        """
-        Calcola la goal_tile finale dopo una svolta a sinistra, basandosi solo su feature vettoriali.
-        """
-        # tile_coords = self._get_tile_from_pos(position)
-
-        # Normalizza l'angolo tra 0 e 2π
-        # angle_norm = angle % (2 * np.pi)
-
-        # Direzione attuale: 0=est, 1=nord, 2=ovest, 3=sud
-        #direction = int(np.round(angle_norm / (0.5 * np.pi))) % 4
-
-        # Dopo svolta a sinistra: nuova direzione
-        # left_turn = {0: 1, 1: 2, 2: 3, 3: 0}
-        # new_direction = left_turn[direction]
-
-        # Delta movimento in base alla nuova direzione
-        # deltas = {0: (1, 0), 1: (0, -1), 2: (-1, 0), 3: (0, 1)}
-        # dx, dy = deltas[new_direction]
-
-        # Tile di destinazione
-        # goal_tile = (tile_coords[0] + dx, tile_coords[1] + dy)
-
-        # return goal_tile
-
-    def get_tile_ahead(env, distance=0.5):
-        """Restituisce le coordinate e il tipo della tile davanti al robot, a distanza specificata"""
-        pos = env.cur_pos
-        angle = env.cur_angle
-
-        # Versore direzione del robot
-        direction = np.array([np.cos(angle), 0, np.sin(angle)])
-    
-        # Punto davanti
-        lookahead_pos = pos + direction * distance
-        i, j = int(np.floor(lookahead_pos[0])), int(np.floor(lookahead_pos[2]))
-
-        try:
-            tile = env.unwrapped._map_tile_dict[(i, j)]
-            return (i, j), tile
-        except KeyError:
-            return None, None
-        
-    def stop_line_ahead(self, img):
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        _, th = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        h, w = th.shape
-        crop = th[h//2:h//2 + h//4, :]  # striscia centrale
-        cnts, _ = cv2.findContours(crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in cnts:
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            if cw > w * 0.6 and ch > h * 0.05:
-                return True
-        return False
-
     def reset(self, seed=None, options=None):
         if seed is not None:
             self.env.seed(seed)
             np.random.seed(seed)
             random.seed(seed)
         self.good_steps = 0
+
         img = self.env.reset()[0]
-
-        self.last_pos = self.env.cur_pos.copy() # Inizializza qui
-
-        # start_pos, start_angle = random.choice(self.possible_starts)
-        # self.env.cur_pos = start_pos.copy()
-        # self.env.cur_angle = start_angle
-        # self.goal_region = self.generate_goal_region_from_start(start_pos, start_angle)
-
-        start_pos, start_angle = random.choice(self.possible_starts)
-        self.goal_region = self.generate_goal_region_from_start(start_pos, start_angle)
-
-        self.env.cur_pos = start_pos.copy()
-        self.env.cur_angle = start_angle
-
-
-        print(f"Posizione iniziale: {self.env.cur_pos}, Angolo: {self.env.cur_angle}")
-
-        self.goal_tile = None
-        self.stop_tile = None
-        self.stop_detected = False
 
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         obs_img = cv2.resize(img, (400, 300))
 
-        # Rileva la linea di stop (opzionale, puoi rimuovere se non serve)
-        cur_pos = self.env.cur_pos
-        tile_size = self.env.road_tile_size
-        cur_tile = tuple(np.floor(cur_pos[:2] / tile_size).astype(int))
+        self.last_pos = self.env.cur_pos.copy()
+        # start_pos, start_angle = random.choice(self.possible_starts)
+        # self.env.cur_pos = start_pos.copy()
+        # self.env.cur_angle = start_angle
 
-        if not self.stop_detected and self.stop_line_detected(obs_img):
-            self.stop_tile = cur_tile
-            self.stop_detected = True
-            print(f"Linea di stop rilevata in tile: {self.stop_tile}")
+        # Inizializza prev_tile alla start_tile
+        # self.prev_tile = self.env.unwrapped.get_grid_coords(start_pos)
+        # self.current_tile = self.prev_tile # Inizialmente prev e current sono uguali
 
-        # Gestione robusta di lane_position
+        self.prev_tile = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
+        self.current_tile = self.prev_tile # Inizialmente prev e current sono uguali
+
+        print(f"Posizione iniziale: {self.env.cur_pos}, Angolo: {self.env.cur_angle}")
+
+        # La goal_region non viene calcolata qui, ma nel metodo step
+        self.goal_tile = None
+        self.goal_center = None # Verrà calcolata una volta definita la goal_center
+
+        self.in_intersection = False
+        self.crossed_intersection = False
+        self.stop_detected = False
+
         try:
             lane_pos = self.env.get_lane_pos2(self.env.cur_pos, self.env.cur_angle)
             lateral = lane_pos.dist
-            angle = lane_pos.angle_deg / 180.0  # normalizza l'angolo in [-1, 1]
+            angle = lane_pos.angle_deg / 180.0
         except Exception as e:
             print(f"[WARN] Could not compute lane pos: {e}")
             lateral = 0.0
             angle = 0.0
         stop_flag = 0.0
-        obs = np.array([lateral, angle, stop_flag], dtype=np.float32)
 
-        # Imposta la goal_region e la lista dei suoi punti
-        self.goal_points = self.generate_goal_region_from_start(start_pos, start_angle)
-        self.goal_region = self.create_goal_region_function(self.goal_points)
+        # dist_to_goal e obs inizializzati senza goal_center
+        # Verranno aggiornati dopo il calcolo di goal_center
 
-        return obs, {}  
 
-    #def _tile_to_pos(self, tile):
-        # Esempio: supponiamo che ogni tile sia larga 1 unità
-        # e che la posizione sia il centro della tile
-        #x, y = tile
-        #return [x + 0.5, 0, y + 0.5]
+        dist_to_goal = 0.0
+        tile_size = self.env.road_tile_size
+        initial_dist_norm = dist_to_goal / (2*tile_size)
+        initial_obs = np.array([lateral, angle, stop_flag, dist_to_goal / (2*tile_size)], dtype=np.float32)
+
+        self.prev_dist_to_goal = initial_dist_norm
+
+        self.last_obs = initial_obs
+
+        self.post_goal_counter = None
+
+        return initial_obs, {} 
 
     def step(self, action):
-        # self.action_space = spaces.Discrete(7)
+        
+        obs_to_return = self.last_obs if self.last_obs is not None else np.zeros(self.env.observation_space.shape, dtype=np.float32)
+
+        if self.post_goal_counter is not None:
+            self.post_goal_counter += 1
+            if self.post_goal_counter >= 200:
+                done = True
+                info = {"post_goal_timeout": True}
+                reward, done_extra, info_extra = compute_reward(action, None, None, None) # Adatta gli argomenti
+                return obs, reward, done, False, info
+            else:
+                reward, _, info_extra = compute_reward(action, None, None, None) # Adatta gli argomenti
+                return obs, reward, False, False, info
 
         action_map = {
-            0: (0.0, 0.3),    # svolta molto forte a sinistra
-            1: (0.1, 0.3),    # svolta forte a sinistra
-            2: (0.2, 0.3),    # svolta leggera a sinistra
-            3: (0.3, 0.3),    # dritto
-            4: (0.3, 0.2),    # svolta leggera a destra
-            5: (0.3, 0.1),    # svolta forte a destra
-            6: (0.3, 0.0),    # svolta molto forte a destra
-        }   
-
+            0: (0.0, 0.3), 1: (0.1, 0.3), 2: (0.2, 0.3), 3: (0.3, 0.3),
+            4: (0.3, 0.2), 5: (0.3, 0.1), 6: (0.3, 0.0),
+        }
         vl, vr = action_map[int(action)]
 
-        raw_obs, _, done, info = self.env.step(np.array([vl, vr]))
+        raw_obs, _, done_env, info = self.env.step(np.array([vl, vr]))
 
-        # ⚠️ Verifica se l'agente ha scelto una svolta a sinistra
-        if int(action) in [0, 1, 2]:
-            if not left_turn_available(self.env):
-                print("Svolta a sinistra non disponibile! Episodio terminato.")
-                reward = -2.0  # penalità opzionale
-                done = True
+        obs = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32) # Valori default, adatta la dimensione
 
         img = self.env.render('rgb_array')
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         obs_img = cv2.resize(img, (400, 300))
-        self.good_steps += 1
+        # Placeholder per stop_line_detected - adattalo alla tua implementazione
+        def stop_line_detected(img):
+            return False
+        stop_flag = 1.0 if stop_line_detected(obs_img) else 0.0
 
-        # Feature extraction
         try:
             lane_pos = self.env.get_lane_pos2(self.env.cur_pos, self.env.cur_angle)
             lateral = lane_pos.dist
-            angle = lane_pos.angle_deg / 180.0  # normalizza l'angolo in [-1, 1]
+            angle = lane_pos.angle_deg / 180.0
             lane_position = {'lateral': lateral, 'angle': angle}
-        except Exception as e:
+        except:
             lane_position = None
-            lateral = 0.0
-            angle = 0.0
-        stop_flag = 1.0 if self.stop_line_ahead(obs_img) else 0.0
-        obs = np.array([lateral, angle, stop_flag], dtype=np.float32)
+            lateral, angle = 0.0, 0.0
 
-        # Calcola la ricompensa usando funzione esterna
+        # Rilevo posizione e tile correnti
+        pos = self.env.unwrapped.cur_pos
+        curr_i, curr_j = self.env.unwrapped.get_grid_coords(pos)
+        self.current_tile = (curr_i, curr_j)
+
+        tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_kind = tile_info["kind"] if tile_info else None
+
+        # if tile_kind and tile_kind.startswith("curve"):
+            # done = True
+            # info["entered_curve"] = True
+            # info["goal_reached"] = False
+            # return obs, 0.0, done, False, info
+
+        # --- Logica per il calcolo della goal_region ---
+        if self.prev_tile != self.current_tile:
+            # Una variazione nella tile è stata rilevata
+            left_turn_result, delta_tile_movement = self.left_turn_available(self.prev_tile, self.current_tile)
+
+            if not left_turn_result:
+                # Se la svolta a sinistra non è permessa, termina e ritorna False
+                # info["left_turn_not_available"] = True
+                # return obs, 0, True, False, info # O gestisci la terminazione come preferisci
+                pass
+            else:
+                
+                direzione = {
+                    (1, 0): (self.current_tile[0], self.current_tile[1] - 1), # sud-nord
+                    (-1, 0): (self.current_tile[0], self.current_tile[1] + 1), # nord-sud
+                    (0, 1): (self.current_tile[0] + 1, self.current_tile[1]), # ovest-est
+                    (0, -1): (self.current_tile[0] - 1, self.current_tile[1]) # est-ovest                             }
+                }                   
+                
+                if delta_tile_movement in direzione:
+                    self.goal_tile = tuple(direzione[delta_tile_movement])
+                    tile_size = self.env.road_tile_size
+                    gx, gy = self.goal_tile
+                    self.goal_center = np.array([gx + 0.5, gy + 0.5]) * tile_size
+                    print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}")
+
+        # --- Fine logica per il calcolo della goal_region ---
+
+        # 7️⃣ Distanza normalizzata dalla goal_center (ora calcolata solo se goal_center esiste)
+        dist_to_goal = 0.0
+        if self.goal_center is not None:
+            pos2d = np.array(self.env.cur_pos)[[0, 2]]
+            dist_to_goal = np.linalg.norm(pos2d - self.goal_center)
+        tile_size = self.env.road_tile_size
+        dist_norm = dist_to_goal / (2 * tile_size)
+
+        # 8️⃣ Composizione osservazione vettoriale
+        obs = np.array([lateral, angle, stop_flag, dist_norm], dtype=np.float32)
+
+
+        # 4️⃣ Gestione flag intersection (solo se left_turn_allowed è True e goal_tile è stata calcolata)
+        if tile_kind in ["3way_left", "4way", "3way_right"] and self.left_turn_allowed and self.goal_tile is not None:
+            center = np.array([curr_i + 0.5, curr_j + 0.5]) # Usa curr_i, curr_j
+            pos2d = np.array(self.env.cur_pos)[[0, 2]] # Usa la posizione corrente
+            d2c = np.linalg.norm(pos2d - center)
+            if d2c < 0.15:
+                self.in_intersection = True
+            if d2c > 0.4 and getattr(self, "in_intersection", False):
+                self.in_intersection = False
+                self.crossed_intersection = True
+        else:
+            vl, vr = action_map[3]  # forzi dritto
+
+        # 9️⃣ Calcolo reward e done_extra
         reward, done_extra, info_extra = self.compute_reward(action, lane_position, obs, img)
+
+        # 🔟 Condizioni di terminazione
+        done = done_env
+
+        # 10.1 Off-road prolungato
+        if lane_position is None:
+            self.offroad_counter += 1
+        else:
+            self.offroad_counter = 0
+        if self.offroad_counter >= self.offroad_max:
+            done = True
+            info['out_of_road'] = True
+
+        # 10.2 Goal raggiunto via tile
+        # Controlla solo se goal_tile è stata impostata
+        if self.goal_tile is not None and self.current_tile == self.goal_tile and self.post_goal_counter is None:
+            self.post_goal_counter = 0
+
+        # 10.3 Attraversamento incrocio
+        if getattr(self, "crossed_intersection", False):
+            done = True
+            info['crossed_intersection'] = True
+
+        # 10.4 Altre condizioni definite da compute_reward
         done = done or done_extra
-        if info_extra is not None:
+        if info_extra:
             info.update(info_extra)
+
+        self.good_steps += 1
+
+        # Aggiorna prev_tile per il prossimo step
+        self.prev_tile = self.current_tile
+        self.last_obs = obs
 
         return obs, reward, done, False, info
 
-    from PIL import Image, ImageDraw
 
     def _highlight_goal_tile(self, obs_image):
         """
@@ -369,43 +413,77 @@ class DuckieRLWrapper(gym.Env):
             obs = self._highlight_goal_tile(obs)
             return obs
 
-    # def render(self, mode='human'):
-        # return self.env.render(mode)
-
     def compute_reward(self, action, lane_position, obs, img):
-        reward = 0.0
+        import numpy as np
+
+        # obs = [lateral, angle, stop_flag, dist_norm]
+        lateral, angle, stop_flag, dist_norm = obs
         done = False
         info_extra = {}
 
+        # Accesso diretto agli attributi della classe
+        tile_kind = self.current_tile_kind
+        left_turn_result = self.current_left_turn_result
+
+        # 1) OUT-OF-LANE
         if lane_position is None:
-            reward -= 20.0  # Uscito completamente dalla corsia
-            done = True
-            info_extra["out_of_lane"] = True
-            return reward, done, info_extra
+            return -20.0, True, {"out_of_lane": True}
+        
+        # 2) INGRESSO IN CURVA (tile_kind.startswith("curve")) - Penalità per curve non desiderate
+        if tile_kind and tile_kind.startswith("curve") and tile_kind != "curve_left":
+            return -10.0, True, {"entered_unwanted_curve": True}
+        
+        # 3) TERMINAZIONE SE LA SVOLTA A SINISTRA NON È CONSENTITA DOVE ATTESA
+        # Questo si attiva se c'è stato un cambio di tile, ma left_turn_available ha restituito False.
+        if self.prev_tile is not None and self.prev_tile != self.current_tile and not left_turn_result:
+             return -5.0, True, {"left_turn_not_available_and_moved": True}
 
-        # -------------------------------
-        # Distanza laterale dalla corsia
-        # -------------------------------
-        lateral_offset = lane_position.get('lateral', 0.0)
-        reward -= abs(lateral_offset) * 2.0  # Penalità crescente
+        # 2) DISTINGUO FASE
+        start_tile = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
+        i, j = start_tile
+        tile_kind = self.env.unwrapped._get_tile(i, j)["kind"]
+        on_straight     = (tile_kind == "straight")
+        in_intersection = (tile_kind in ["3way_left", "4way", "curve_left"])
 
-        if abs(lateral_offset) > 0.3:
-            reward -= 5.0  # Penalità extra se molto fuori
+        # 3) RESET prev dist in caso nuovo episodio
+        if not hasattr(self, "prev_dist_to_goal"):
+            self.prev_dist_to_goal = dist_norm
 
-        # -------------------------------
-        # Penalità angolare
-        # -------------------------------
-        if self.env.step_count > 10:
-            angle = lane_position.get('angle', 0.0)
-            ref_heading = lane_position.get('ref_heading', 0.0)
-            angle_diff = np.abs((angle - ref_heading + np.pi) % (2 * np.pi) - np.pi)
-            reward -= angle_diff * 0.5
-        else:
-            angle_diff = 0.0
+        reward = 0.0
 
-        # -------------------------------
-        # Penalità per oscillazioni
-        # -------------------------------
+        # 4) FASE 1: rettilineo → centratura
+        if on_straight:
+            reward -= abs(lateral) * 2.0
+            reward -= abs(angle)   * 3.0
+            # bonus per mantenersi perfetto
+            if abs(lateral)<0.05 and abs(angle)<0.1 and action==3:
+                reward += 1
+
+        elif in_intersection:
+            # left_turn = self.left_turn_available()
+
+            #if left_turn:
+                # Vuoi che inizi la curva: deve muoversi verso centro tile e angolo di svolta
+            reward -= abs(lateral) * 1.0  # spingilo verso il centro
+            reward += abs(angle)   * 2  # più gira, meglio è
+
+            # Penalizza se continua ad andare dritto
+            if action == 3:  # 3 = avanti
+                reward -= 4.0  # forte penalità
+            elif action == 1:  # 1 = sinistra
+                reward += 2.0  # bonus se inizia la svolta
+
+            else:
+                # Caso in cui non è prevista la svolta: ricompensa neutra, evita strafare
+                delta = self.prev_dist_to_goal - dist_norm
+                reward += delta * 5.0
+                reward -= abs(lateral) * 0.5
+                reward -= abs(angle) * 0.2
+
+            # Salva distanza per prossima iterazione
+            self.prev_dist_to_goal = dist_norm
+
+        # 7) OSCILLAZIONI (comune)
         if self.last_action is not None and ((self.last_action == 0 and action == 2) or (self.last_action == 2 and action == 0)):
             self.oscillation_count += 1
         else:
@@ -414,67 +492,16 @@ class DuckieRLWrapper(gym.Env):
         if self.oscillation_count >= 3:
             reward -= 1.0
 
-        # -------------------------------
-        # Penalità se nella corsia sbagliata
-        # -------------------------------
-        wrong_side = False
-        try:
-            start = np.array(lane_position.lane_segment['start_node'])
-            end = np.array(lane_position.lane_segment['end_node'])
-            direction = end - start
+        # 8) RAGGIUNGIMENTO GOAL
+        current_tile = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
 
-            if tuple(direction) in [(0, 1), (1, 0)]:  # Nord o Est → corsia destra = lateral > 0
-                if lateral_offset < 0:
-                    reward -= 2.0
-                    wrong_side = True
-            elif tuple(direction) in [(0, -1), (-1, 0)]:  # Sud o Ovest → corsia destra = lateral < 0
-                if lateral_offset > 0:
-                    reward -= 2.0
-                    wrong_side = True
-        except Exception:
-            pass
-
-        info_extra["wrong_side"] = wrong_side
-
-        # -------------------------------
-        # Ricompensa per stare bene in corsia
-        # -------------------------------
-        if abs(lateral_offset) < 0.05 and angle_diff < 0.1 and not wrong_side:
-            reward += 1.0  # piccolo bonus per buon comportamento
-
-        # Penalizza se ruota troppo quando è già ben centrato
-        if abs(lateral_offset) < 0.05 and abs(angle_diff) > 0.2:
-            reward -= 1.0  # puoi regolare l'intensità a piacere
-
-        # Premia se è centrato e sceglie di andare dritto (solo se azioni discrete)
-        if abs(lateral_offset) < 0.05 and abs(angle_diff) < 0.1 and action == 3:
-            reward += 0.5  # puoi aumentare leggermente se non si nota miglioramento
-
-        # -------------------------------
-        # Goal raggiunta
-        # -------------------------------
-        if self.goal_region(self.env.cur_pos, self.env.cur_angle):
+        
+        if current_tile == self.goal_tile:
             reward += 100.0
             done = True
             info_extra["goal_reached"] = True
 
-        # -------------------------------
-        # Ricompensa per avvicinamento alla goal
-        # -------------------------------
-        if hasattr(self, "last_pos"):
-            if hasattr(self, "goal_points"):
-                goal_center = np.mean(self.goal_points, axis=0)[[0, 2]]
-            else:
-                forward_dir = np.array([np.cos(self.env.cur_angle), np.sin(self.env.cur_angle)])
-                goal_center = np.array(self.env.cur_pos)[[0, 2]] + 0.8 * forward_dir
-
-            old_dist = np.linalg.norm(np.array(self.last_pos)[[0, 2]] - goal_center)
-            new_dist = np.linalg.norm(np.array(self.env.cur_pos)[[0, 2]] - goal_center)
-            reward += (old_dist - new_dist) * 1.5
-        self.last_pos = self.env.cur_pos
-
         return reward, done, info_extra
-
 
 class LaneFollower:
     def __init__(self, kp=0.8, ki=0.0, kd=0.2,
@@ -622,6 +649,23 @@ def main():
     save_dir = os.path.join(os.getcwd(), today_folder)
     os.makedirs(save_dir, exist_ok=True)
 
+    possible_starts = [
+        (1, 2),  # da nord verso sud
+        (3, 2),  # da sud verso nord
+        (2, 1),  # da ovest verso est
+        (2, 3),  # da est verso ovest
+        (3, 0),
+        (1, 0),
+        (0, 1),
+        (0, 3),
+        (4, 3),
+        (4, 1),
+        (3, 4),
+        (1, 4),                    
+        ]
+
+    tile = random.choice(possible_starts)
+
     # Setup environment
     if args.env_name and "Duckietown" in args.env_name:
         env = DuckietownEnv(
@@ -632,12 +676,12 @@ def main():
             distortion=args.distortion,
             seed=args.seed,
             frame_skip=args.frame_skip,
-            max_steps=500,
+            max_steps=800,
             camera_rand=False,
             dynamics_rand=False,
             randomize_maps_on_reset=False,
-            user_tile_start=(1, 2),
-            # user_angle_start=[-np.pi / 2]
+            user_tile_start=tile,
+  
         )
 
     else:
@@ -647,20 +691,6 @@ def main():
     env = DummyVecEnv([lambda: env])  # Necessario per stable-baselines3
 
     raw_env = env.envs[0].env
-
-    # raw_env.render(mode='human')  # Crea la finestra se non esiste ancora
-
-    # @raw_env.unwrapped.window.event
-    # def on_key_press(symbol, modifiers):
-        #if symbol in (key.BACKSPACE, key.SLASH):
-            #raw_env.reset() 
-            #raw_env.render()
-        #elif symbol == key.ESCAPE:
-            #raw_env.close()
-            #sys.exit(0)
-
-    # Addestrare l'agente RL
-    # Crea e addestra il modello PPO
 
     start_time = time.time()
 
@@ -686,7 +716,7 @@ def main():
 
     # Avvia il training vero
     # Training in modalità batch
-    num_batches = 3
+    num_batches = 10
     timesteps_per_batch = 100000
 
     # Lista per memorizzare le ricompense episodiche
@@ -744,6 +774,7 @@ def main():
         frames = []
         step_counter = {'step': 0}
         obs = env.reset()
+        raw_env.reset()
 
         def update(dt):
             if step_counter['step'] >= max_steps:
