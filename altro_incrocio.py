@@ -40,21 +40,6 @@ class DuckieRLWrapper(gym.Env):
         super(DuckieRLWrapper, self).__init__()
         self.env = env
 
-                        # Lista delle posizioni iniziali possibili (posizione, angolo)
-        # self.possible_starts = [
-            #(np.array([1.85313356, 0., 1.5687472]), -0.06229765469565894),
-            #(np.array([1.35389949, 0., 1.89896477]), -1.6180560830233601),
-            #(np.array([0.69820322, 0., 1.5677339]), -0.028414341288794793),
-            #(np.array([0.2134203, 0., 0.60191441]), -1.5570214445017387),
-            #(np.array([0.72964605, 0., 1.56071875]), -0.21878014687120712),
-            #(np.array([1.9739118, 0., 1.60418237]), 0.018816033774968922),
-            #(np.array([1.61513161, 0., 2.01799389]), 1.5476869500965005),
-            #(np.array([1.64426201, 0., 0.75767361]), 1.5476869500965005),
-            #(np.array([1.58126874, 0., 2.19177157]), 1.5289606578796389),
-            #(np.array([1.84308267, 0., 1.51558419]), 0.04482048222269934),
-            #(np.array([2.14962907, 0., 0.20062444]), 3.088490894742158)
-            #]
-
         possible_starts = [
             ((1, 2), 0),  # da nord verso sud
             ((3, 2), 1), # da sud verso nord
@@ -70,8 +55,9 @@ class DuckieRLWrapper(gym.Env):
             ((1, 4), 3)                   
             ]
         
-        self.current_road_abs_angle = None 
+        self.current_road_abs_angle = None
 
+        self.prev_lateral = None
         # Scegli una tile iniziale casuale dalla lista
         start_pos, start_angle = random.choice(possible_starts)
         self.num_steps = 0
@@ -122,7 +108,6 @@ class DuckieRLWrapper(gym.Env):
     def seed(self, seed=None):
         return self.env.seed(seed)
     
-    
     def left_turn_available(self, prev, curr):
         """
         Determina se la svolta a sinistra è disponibile nell'incrocio corrente,
@@ -153,28 +138,61 @@ class DuckieRLWrapper(gym.Env):
         # Se siamo in una 4-way, la svolta a sinistra è sempre disponibile
         if tile_type == "4way":
             return True, (curr_i - prev_i, curr_j - prev_j)
-        elif tile_type == "3way_left":
+        elif tile_type == "3way_left" or tile_type == "3way_right":
             # Regole per 3-way sinistra — svolta possibile solo da certe direzioni
             valid_entries_for_left_turn = {
-                (2, 0): (3, 0),  # da sud
-                (2, 4): (1, 4),  # da est
-                (4, 2): (3, 2),  # da nord
-                (0, 2): (1, 2),  # da ovest
-                (0, 2): (0, 1),
-                (4, 2): (4, 3),
-                (2, 0): (2, 1), 
-                (2, 4): (2, 3)
+                (2, 0): [(3, 0), (2, 1)],  # da sud
+                (2, 4): [(1, 4), (2, 3)],  # da est
+                (4, 2): [(3, 2), (4, 3)], # da nord
+                (0, 2): [(1, 2), (0, 1)]# da ovest
             }
 
             if curr in valid_entries_for_left_turn:
-                return prev == valid_entries_for_left_turn[curr], (curr_i - prev_i, curr_j - prev_j)
+                return prev in valid_entries_for_left_turn[curr], (curr_i - prev_i, curr_j - prev_j)
             else:
                 # Se non è una direzione valida per la svolta a sinistra, non è permessa
                 return False, None
         else:
             # In altri casi la svolta non è permessa
             return False, None
+        
+    def right_turn_available(self, prev, curr):
+        """
+        Determina se la svolta a destra è disponibile nell'incrocio corrente,
+        in base alla tile di provenienza e al tipo di incrocio.
+        """
+        
+        prev_i, prev_j = prev
+        curr_i, curr_j = curr
 
+        # i, j = self.env.unwrapped.get_grid_coords(self.env.unwrapped.curr)
+        # 'curr' è già la tupla (i, j) che rappresenta la tile corrente
+
+        tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type = tile_type1["kind"] if tile_info else None
+
+
+        # Se siamo in una 4-way, la svolta a destra è sempre disponibile
+        if tile_type == "4way":
+            return True, (curr_i - prev_i, curr_j - prev_j)
+        elif tile_type == "3way_left" or tile_type == "3way_right":
+            # Regole per 3-way sinistra — svolta possibile solo da certe direzioni
+            valid_entries_for_right_turn = {
+                (2, 0): [(2, 1), (1, 0)], 
+                (0, 2): [(0, 3), (1, 2)], 
+                (4, 2): [(3, 1), (4, 1)],
+                (2, 4): [(3, 4), (2, 3)]
+            }
+
+            if curr in valid_entries_for_right_turn:
+                return prev == valid_entries_for_right_turn[curr], (curr_i - prev_i, curr_j - prev_j)
+            else:
+                # Se non è una direzione valida per la svolta a sinistra, non è permessa
+                return False, None
+        else:
+            # In altri casi la svolta non è permessa
+            return False, None
 
     def stop_line_detected(self, img):
         hsv   = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
@@ -205,13 +223,6 @@ class DuckieRLWrapper(gym.Env):
         obs_img = cv2.resize(img, (400, 300))
 
         self.last_pos = self.env.cur_pos.copy()
-        # start_pos, start_angle = random.choice(self.possible_starts)
-        # self.env.cur_pos = start_pos.copy()
-        # self.env.cur_angle = start_angle
-
-        # Inizializza prev_tile alla start_tile
-        # self.prev_tile = self.env.unwrapped.get_grid_coords(start_pos)
-        # self.current_tile = self.prev_tile # Inizialmente prev e current sono uguali
 
         self.prev_tile = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
         self.current_tile = self.prev_tile # Inizialmente prev e current sono uguali
@@ -230,6 +241,8 @@ class DuckieRLWrapper(gym.Env):
             lane_pos = self.env.get_lane_pos2(self.env.cur_pos, self.env.cur_angle)
             lateral = lane_pos.dist
             angle = lane_pos.angle_deg / 180.0
+            dot_dir = lane_pos.dot_dir
+
         except Exception as e:
             print(f"[WARN] Could not compute lane pos: {e}")
             lateral = 0.0
@@ -303,6 +316,15 @@ class DuckieRLWrapper(gym.Env):
             lane_position = None
             lateral, angle = 0.0, 0.0
 
+        delta_lateral = 0.0
+        if self.prev_lateral is not None and not self.in_intersection and lane_position is not None:
+            delta_lateral = abs(lane_pos.dist - self.prev_lateral)
+        self.prev_lateral = lane_pos.dist if lane_position is not None else None
+        
+        dot_dir = lane_pos.dot_dir
+
+        self.delta_lateral = delta_lateral  # lo passi implicitamente a reward_straight
+
         # Rilevo posizione e tile correnti
         pos = self.env.unwrapped.cur_pos
         curr_i, curr_j = self.env.unwrapped.get_grid_coords(pos)
@@ -323,15 +345,15 @@ class DuckieRLWrapper(gym.Env):
             left_turn_result, delta_tile_movement = self.left_turn_available(self.prev_tile, self.current_tile)
 
             # Mappatura di delta_tile_movement a angoli assoluti in radianti
-            # Convenzione angoli assoluti: 0=Est, pi/2=Nord, pi=Ovest, -pi/2=Sud
-            if delta_tile_movement == (1, 0):    # Movimento Est
-                self.current_road_abs_angle = 0.0 #
-            elif delta_tile_movement == (-1, 0): # Movimento Ovest
-                self.current_road_abs_angle = np.pi #
-            elif delta_tile_movement == (0, 1):  # Movimento Nord
-                self.current_road_abs_angle = np.pi / 2 #
-            elif delta_tile_movement == (0, -1): # Movimento Sud
-                self.current_road_abs_angle = -np.pi / 2 #
+            # Convenzione angoli assoluti: 0=nord, pi/2=ovest, pi=sud, -pi/2=est
+            if delta_tile_movement == (1, 0):    # Movimento nord
+                self.current_road_abs_angle = 0.0 
+            elif delta_tile_movement == (-1, 0): # Movimento sud
+                self.current_road_abs_angle = np.pi 
+            elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                self.current_road_abs_angle = np.pi / 2 
+            elif delta_tile_movement == (0, 1): # Movimento est
+                self.current_road_abs_angle = -np.pi / 2 
             else:
                 # Se non è un movimento rettilineo (es. transizione in una curva o incrocio con svolta)
                 self.current_road_abs_angle = None #
@@ -339,7 +361,6 @@ class DuckieRLWrapper(gym.Env):
             if not left_turn_result:
                 # Se la svolta a sinistra non è permessa, termina e ritorna False
                 # info["left_turn_not_available"] = True
-                # return obs, 0, True, False, info # O gestisci la terminazione come preferisci
                 pass
             else:
                 
@@ -348,6 +369,47 @@ class DuckieRLWrapper(gym.Env):
                     (-1, 0): (self.current_tile[0], self.current_tile[1] + 1), # nord-sud
                     (0, 1): (self.current_tile[0] + 1, self.current_tile[1]), # ovest-est
                     (0, -1): (self.current_tile[0] - 1, self.current_tile[1]) # est-ovest                             }
+                }                   
+                
+                if delta_tile_movement in direzione:
+                    self.goal_tile = tuple(direzione[delta_tile_movement])
+                    tile_size = self.env.road_tile_size
+                    gx, gy = self.goal_tile
+                    self.goal_center = np.array([gx + 0.5, gy + 0.5]) * tile_size
+                    print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}")
+
+        # MOMENTANEO PER LOGICA CURVA A DESTRA
+
+        if self.prev_tile != self.current_tile:
+            # Una variazione nella tile è stata rilevata
+            right_turn_result, delta_tile_movement = self.right_turn_available(self.prev_tile, self.current_tile)
+
+            # Mappatura di delta_tile_movement a angoli assoluti in radianti
+            # Convenzione angoli assoluti: 0=nord, pi/2=ovest, pi=sud, -pi/2=est
+            if delta_tile_movement == (1, 0):    # Movimento nord
+                self.current_road_abs_angle = 0.0 
+            elif delta_tile_movement == (-1, 0): # Movimento sud
+                self.current_road_abs_angle = np.pi 
+            elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                self.current_road_abs_angle = np.pi / 2 
+            elif delta_tile_movement == (0, 1): # Movimento est
+                self.current_road_abs_angle = -np.pi / 2 
+            else:
+                # Se non è un movimento rettilineo (es. transizione in una curva o incrocio con svolta)
+                self.current_road_abs_angle = None #
+
+            if not right_turn_result:
+                # Se la svolta a sinistra non è permessa, termina e ritorna False
+                # info["left_turn_not_available"] = True
+                # return obs, 0, True, False, info # O gestisci la terminazione come preferisci
+                pass
+            else:
+                
+                direzione = {
+                    (1, 0): (self.current_tile[0], self.current_tile[1] + 1), # sud-nord
+                    (-1, 0): (self.current_tile[0], self.current_tile[1] - 1), # nord-sud
+                    (0, 1): (self.current_tile[0] - 1, self.current_tile[1]), # est-ovest
+                    (0, -1): (self.current_tile[0] + 1, self.current_tile[1]) # ovest-est                            }
                 }                   
                 
                 if delta_tile_movement in direzione:
@@ -378,9 +440,9 @@ class DuckieRLWrapper(gym.Env):
             center = np.array([curr_i + 0.5, curr_j + 0.5]) # Usa curr_i, curr_j
             pos2d = np.array(self.env.cur_pos)[[0, 2]] # Usa la posizione corrente
             d2c = np.linalg.norm(pos2d - center)
-            if d2c < 0.15:
+            if d2c < 0.25:
                 self.in_intersection = True
-            if d2c > 0.4 and getattr(self, "in_intersection", False):
+            if d2c > 0.5 and getattr(self, "in_intersection", False):
                 self.in_intersection = False
                 self.crossed_intersection = True
         else:
@@ -424,34 +486,6 @@ class DuckieRLWrapper(gym.Env):
 
         return obs, reward, done, False, info
 
-
-    def _highlight_goal_tile(self, obs_image):
-        """
-        Disegna un rettangolo rosso sulla goal_tile nella visualizzazione dell'ambiente.
-        """
-        if not hasattr(self, "goal_tile") or self.goal_tile is None:
-            return obs_image  # niente da disegnare
-
-        img = Image.fromarray(obs_image)
-        draw = ImageDraw.Draw(img)
-
-        # Coordinate tile (es. [2, 4])
-        tile_x, tile_y = self.goal_tile
-
-        # Calcola posizione in pixel
-        map_width, map_height = self.env.map_shape
-        cam_w, cam_h = self.env.camera_width, self.env.camera_height
-        tile_size_px_x = cam_w / map_width
-        tile_size_px_y = cam_h / map_height
-
-        px = int((tile_x + 0.5) * tile_size_px_x)
-        py = int((tile_y + 0.5) * tile_size_px_y)
-
-        box_size = 10
-        draw.rectangle([px - box_size, py - box_size, px + box_size, py + box_size], outline="red", width=3)
-
-        return np.array(img)
-
     def render(self, mode='human'):
         # obs = self.env.render(mode='rgb_array')
 
@@ -460,43 +494,41 @@ class DuckieRLWrapper(gym.Env):
             return self.env.render(mode='human')
         else:
             obs = self.env.render(mode='rgb_array')
-            obs = self._highlight_goal_tile(obs)
+            # obs = self._highlight_goal_tile(obs)
             return obs
 
-    def reward_straight(self, action, lateral, angle, agent_abs_angle, tile_pos):
+    def reward_straight(self, action, lateral, angle, dot_dir):
         reward = 0.0
-        WEIGHT_LAT = 2.0
-        WEIGHT_ANG = 5.0
 
-        reward -= abs(lateral) * WEIGHT_LAT
+        # 1. Penalità per offset laterale dalla corsia
+        reward -= abs(lateral) * 2.0
 
-        horizontal_tiles = [(1,0), (3,0), (1,1), (1,2), (3,2), (1,4), (3,4)]
-        vertical_tiles = [(0,1), (0,3), (2,1), (2,3), (4,1), (4,3)]
+        # 2. Premia l'allineamento alla corsia
+        if not self.in_intersection:
+            reward += 3.0 * dot_dir  # massimo +2 se perfettamente allineato
 
-        if tile_pos in horizontal_tiles:
-            road_angle = 0.0
-        elif tile_pos in vertical_tiles:
-            road_angle = np.pi / 2
-        else:
-            road_angle = None
-
-        if road_angle is not None:
-            angle_diff = np.arctan2(np.sin(agent_abs_angle - road_angle), np.cos(agent_abs_angle - road_angle))
-            reward -= abs(angle_diff) * WEIGHT_ANG
-            if abs(angle_diff) < 0.1:
+        # 3. Premia azione "dritto" se ben allineato
+        if dot_dir > 0.95 and action == 3:
+            reward += 2.0
+        # 4. Premia correzioni ragionevoli se disallineato
+        elif dot_dir < 0.95:
+            if angle > 0.1 and action in [4, 5, 6]:  # curva a destra
                 reward += 1.0
+            elif angle < -0.1 and action in [0, 1, 2]:  # curva a sinistra
+                reward += 1.0
+            else:
+                reward -= 0.2  # azione incoerente
 
-        # Azione coerente con orientamento
-        if angle > 0.05 and action in [4,5,6]: reward += 0.5
-        elif angle < -0.05 and action in [0,1,2]: reward += 0.5
-        elif abs(angle) <= 0.05 and action == 3: reward += 1.0
-        else: reward -= 0.5
+        # 5. Bonus extra se perfettamente centrato, orientato e dritto
+        if abs(lateral) < 0.05 and dot_dir > 0.98 and action == 3:
+            reward += 1.5
 
-        if abs(lateral) < 0.05 and abs(angle) < 0.1 and action == 3:
-            reward += 1.0
+        # 6. Penalità per oscillazioni laterali (variazione da step precedente)
+        if hasattr(self, "delta_lateral") and not self.in_intersection:
+            reward -= 3.0 * self.delta_lateral
 
         return reward
-    
+
     def reward_curve(self, action, lateral, angle, kind):
         reward = 0.0
         if kind == "curve_left":
@@ -517,22 +549,23 @@ class DuckieRLWrapper(gym.Env):
     
     def reward_intersection(self, action, lateral, angle, dist_norm):
         reward = 0.0
-        reward -= abs(lateral)
+        reward -= 2.0 * abs(lateral)
 
         if action == 3:
             reward -= 4.0
         elif action == 1:  # sinistra
-            reward += 2.0
+            reward += 6.0
         else:
             reward -= abs(angle) * 0.2
 
         delta = self.prev_dist_to_goal - dist_norm
         reward += delta * 5.0
 
+        if abs(lateral) > 0.4:
+            reward -= 5.0
+            done = True
+
         return reward
-
-
-
 
     def compute_reward(self, action, lane_position, obs, img):
         import numpy as np
@@ -554,7 +587,8 @@ class DuckieRLWrapper(gym.Env):
             self.prev_dist_to_goal = dist_norm
 
         if tile_kind == "straight":
-            reward += self.reward_straight(action, lateral, angle, agent_abs_angle, start_tile)
+            # reward += self.reward_straight(action, lateral, angle, agent_abs_angle, start_tile)
+            reward = self.reward_straight(action, lateral, angle, lane_position.dot_dir)
         elif tile_kind in ["curve_left", "curve_right"]:
             reward += self.reward_curve(action, lateral, angle, tile_kind)
         elif tile_kind in ["3way_left", "3way_right", "4way"]:
@@ -577,7 +611,6 @@ class DuckieRLWrapper(gym.Env):
             info_extra["goal_reached"] = True
 
         return reward, done, info_extra
-
 
 class LaneFollower:
     def __init__(self, kp=0.8, ki=0.0, kd=0.2,
@@ -758,14 +791,14 @@ def main():
     model = DQN(
         policy="MlpPolicy",
         env=env,
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         buffer_size=100_000,               # AUMENTATO
         learning_starts=5000,              # Parte dopo aver riempito un po' di buffer
         batch_size=128,
         tau=1.0,                           # Soft update, può restare così
         gamma=0.99,
         train_freq=4,
-        gradient_steps=1,
+        gradient_steps=2,
         target_update_interval=1000,
         exploration_fraction=0.1,
         exploration_final_eps=0.01,
@@ -777,7 +810,7 @@ def main():
 
     # Avvia il training vero
     # Training in modalità batch
-    num_batches = 10
+    num_batches = 5
     timesteps_per_batch = 100000
 
     # Lista per memorizzare le ricompense episodiche
@@ -868,7 +901,7 @@ def main():
         plt.plot(moving_average(test_rewards, window))
         plt.xlabel('Passi')
         plt.ylabel('Ricompensa media (finestra 10)')
-        plt.title('Performance dell’agente PPO nel test')
+        plt.title('Performance dell’agente DQN nel test')
         plt.grid()
         plt.show()
     else:
@@ -877,8 +910,8 @@ def main():
     env.close()
 
     try:
-        model.save("ppo_duckietown_model")
-        print("Modello salvato correttamente come ppo_duckietown_model")
+        model.save("dqn_duckietown_model")
+        print("Modello salvato correttamente come dqn_duckietown_model")
     except Exception as e:
         print(f"Errore durante il salvataggio del modello: {e}")
    
