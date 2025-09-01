@@ -28,6 +28,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import random
+import yaml
+import numpy as np
 
 def moving_average(x, w):
 
@@ -39,46 +41,54 @@ class DuckieRLWrapper(gym.Env):
     def __init__(self, env):
         super(DuckieRLWrapper, self).__init__()
         self.env = env
-
-        possible_starts = [
-            ((1, 2), 0),  # da nord verso sud
-            ((3, 2), 1), # da sud verso nord
-            ((2, 1), 2), # da ovest verso est
-            ((2, 3), 3), # da est verso ovest
-            ((3, 0), 0),
-            ((1, 0), 1),
-            ((0, 1), 2),
-            ((0, 3), 3),
-            ((4, 3), 0),
-            ((4, 1), 1),
-            ((3, 4), 2), 
-            ((1, 4), 3)                   
-            ]
         
-        self.tile_kinds = ["straight", "curve_left", "curve_right", "3way_left", "3way_right", "4way", "asphalt"]
+        self.tile_kinds = ["straight", "curve_left", "curve_right", "3way_left", "3way_right", "4way"]
+        self.action_types = ['left', 'right', 'straight']
 
+        # initial_pos = [[1.3455,  0.,      0.73125], # ovest-est
+                       # [0.73125, 0.,      1.5795 ], # sud-nord
+                       # [1.5795,  0.,      2.19375], # est-ovest
+                       # [2.19375, 0.,      1.3455 ]] # nord-sud
         
+        # self.env.cur_pos = random.choice(initial_pos)
+
+        # self.env.cur_angle = 0.0
+
+        self.tile_counter = 0
+
+        self.direzione = None
+
+        flag = None
+
+        self.best_curve = None
+
+        self.max_offset = 0.35
+
+        self.max_angle = 0.157
+
+        self.lane_width = 0.22
+
+        self.current_target_curve = None  # Inizializza a None o un valore di default appropriato
+
         self.current_road_abs_angle = None
 
         self.prev_lateral = None
         # Scegli una tile iniziale casuale dalla lista
-        start_pos, start_angle = random.choice(possible_starts)
+        # start_pos = random.choice(initial_pos)
         self.num_steps = 0
 
         # Imposta la posizione e angolo dell'agente
-        self.env.cur_pos = np.array([
-            start_pos[0] + 0.5,  # X (centro della tile)
-            0.0,                 # Y (altezza fissa, verrà gestita internamente)
-            start_pos[1] + 0.5   # Z (centro della tile)
-        ])
+        # self.env.cur_pos = np.array(start_pos)
 
-        self.env.cur_angle = start_angle
+        # self.env.cur_angle = 0.0
 
         self.oscillation_count = 0
         self.last_action = None
 
         # Per il tracking del movimento verso la goal
         self.last_pos = None
+
+        self.normalized_dist = 0.0
 
         # modificato dimensione da (480, 680, 3) per ridurre il carico computazionale
 
@@ -90,7 +100,7 @@ class DuckieRLWrapper(gym.Env):
         # )
 
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
         )
 
         self.action_space = spaces.Discrete(7)  # Azioni: sinistra, dritto, destra (per semplificare)
@@ -101,6 +111,8 @@ class DuckieRLWrapper(gym.Env):
         self.last_action = None
         self.oscillation_count = 0
         self.lane_pos = None
+        self.curve_type = None
+        
 
         self.offroad_counter = 0
         self.offroad_max = 5   # numero di step consecutivi tollerati fuori strada
@@ -141,8 +153,7 @@ class DuckieRLWrapper(gym.Env):
         # 'curr' è già la tupla (i, j) che rappresenta la tile corrente
         curr_i, curr_j = curr
         tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
-        tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
-        tile_type = tile_type1["kind"] if tile_info else None
+        tile_type = tile_info["kind"] if tile_info else None
 
 
         # Se siamo in una 4-way, la svolta a sinistra è sempre disponibile
@@ -179,30 +190,62 @@ class DuckieRLWrapper(gym.Env):
         # 'curr' è già la tupla (i, j) che rappresenta la tile corrente
 
         tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
-        tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
-        tile_type = tile_type1["kind"] if tile_info else None
+        # tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type = tile_info["kind"] if tile_info else None
 
 
         # Se siamo in una 4-way, la svolta a destra è sempre disponibile
         if tile_type == "4way":
             return True, (curr_i - prev_i, curr_j - prev_j)
-        elif tile_type == "3way_left" or tile_type == "3way_right":
+        elif tile_type == "3way_left":
             # Regole per 3-way sinistra — svolta possibile solo da certe direzioni
             valid_entries_for_right_turn = {
                 (2, 0): [(2, 1), (1, 0)], 
                 (0, 2): [(0, 3), (1, 2)], 
-                (4, 2): [(3, 1), (4, 1)],
+                (4, 2): [(3, 2), (4, 1)],
                 (2, 4): [(3, 4), (2, 3)]
             }
 
             if curr in valid_entries_for_right_turn:
-                return prev == valid_entries_for_right_turn[curr], (curr_i - prev_i, curr_j - prev_j)
-            else:
-                # Se non è una direzione valida per la svolta a sinistra, non è permessa
-                return False, None
-        else:
-            # In altri casi la svolta non è permessa
-            return False, None
+                if prev in valid_entries_for_right_turn[curr]:
+                    return True, (curr_i - prev_i, curr_j - prev_j)
+                else:
+                    return False, None
+        
+    def go_straight(self, prev, curr):
+        """
+        Determina se la svolta a destra è disponibile nell'incrocio corrente,
+        in base alla tile di provenienza e al tipo di incrocio.
+        """
+        
+        prev_i, prev_j = prev
+        curr_i, curr_j = curr
+
+        # i, j = self.env.unwrapped.get_grid_coords(self.env.unwrapped.curr)
+        # 'curr' è già la tupla (i, j) che rappresenta la tile corrente
+
+        tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+        # tile_type1 = self.env.unwrapped._get_tile(curr_i, curr_j)
+        tile_type = tile_info["kind"] if tile_info else None
+
+
+        # Se siamo in una 4-way, la svolta a destra è sempre disponibile
+        if tile_type == "4way":
+            return True, (curr_i - prev_i, curr_j - prev_j)
+        elif tile_type == "3way_left":
+            # Regole per 3-way sinistra — svolta possibile solo da certe direzioni
+            valid_entries_for_straight = {
+                (2, 0): [(3, 0), (1, 0)], 
+                (0, 2): [(0, 3), (0, 1)], 
+                (4, 2): [(4, 3), (4, 1)],
+                (2, 4): [(3, 4), (1, 4)]
+            }
+
+            if curr in valid_entries_for_straight:
+                if prev in valid_entries_for_straight[curr]:
+                    return True, (curr_i - prev_i, curr_j - prev_j)
+                else:
+                    return False, None
 
     def stop_line_detected(self, img):
         hsv   = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
@@ -247,10 +290,12 @@ class DuckieRLWrapper(gym.Env):
         self.crossed_intersection = False
         self.stop_detected = False
 
+        self.tile_counter = 0
+
         try:
             lane_pos = self.env.get_lane_pos2(self.env.cur_pos, self.env.cur_angle)
             lateral = lane_pos.dist
-            angle = lane_pos.angle_deg / 180.0
+            angle = lane_pos.angle_rad # / 180.0
             dot_dir = lane_pos.dot_dir
 
         except Exception as e:
@@ -263,7 +308,6 @@ class DuckieRLWrapper(gym.Env):
         # dist_to_goal e obs inizializzati senza goal_center
         # Verranno aggiornati dopo il calcolo di goal_center
 
-
         if self.goal_tile is not None:
             cur_tile = self.env.get_current_tile()
             dist_to_goal = np.linalg.norm(np.array(cur_tile) - np.array(self.goal_tile))
@@ -272,46 +316,122 @@ class DuckieRLWrapper(gym.Env):
 
         tile_size = self.env.road_tile_size
         initial_dist_norm = dist_to_goal / (2*tile_size)
+        initial_dist_curve = dist_to_goal / (2*tile_size)
+
         i, j = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
         tile_kind = self.env.unwrapped._get_tile(i, j)["kind"]
         tile_one_hot = self.tile_one_hot(tile_kind)
 
+        # if self.prev_tile != self.current_tile:
+            # if tile_kind in ["3way_left", "4way"]:
+                # in_intersection = 1
+                # print(self.prev_tile, self.current_tile, tile_kind)
+                # Una variazione nella tile è stata rilevata
+                # left_turn_result, delta_tile_movement_left = self.left_turn_available(self.prev_tile, self.current_tile)
+                # right_turn_result, delta_tile_movement_right = self.right_turn_available(self.prev_tile, self.current_tile)
+                # straight_result, delta_tile_movement_straight = self.go_straight(self.prev_tile, self.current_tile)
+
+                # chose_direction = []
+                # if left_turn_result: chose_direction.append(["left", delta_tile_movement_left])
+                # if right_turn_result: chose_direction.append(["right", delta_tile_movement_right])
+                # if straight_result: chose_direction.append(["straight", delta_tile_movement_straight])
+
+                # self.direzione, delta_tile_movement = random.choice(chose_direction)
+        
+        if tile_kind == "straight":
+            self.direzione = "straight"
+
+        action_one_hot = self.action_one_hot(self.direzione)
+
+        # if tile_kind in ["3way_left", "3way_right", "4way"]:
+            # in_intersection = 1
+        # else:
+            # in_intersection = 0
+
         # Componi l’osservazione finale (senza più stop_flag)
         initial_obs = np.concatenate(
-            (np.array([lateral, angle, initial_dist_norm, dot_dir], dtype=np.float32), tile_one_hot),
+            (np.array([lateral, angle, initial_dist_norm, initial_dist_curve], dtype=np.float32), tile_one_hot, action_one_hot),
             axis=0
         )
 
         self.prev_dist_to_goal = initial_dist_norm
+        self.prev_dist_curve = initial_dist_curve
 
         self.last_obs = initial_obs
 
         self.post_goal_counter = None
 
+        # initial_pos = [[1.3455,  0.,      0.73125], # ovest-est
+                       # [0.73125, 0.,      1.5795 ], # sud-nord
+                       # [1.5795,  0.,      2.19375], # est-ovest
+                       # [2.19375, 0.,      1.3455 ]] # nord-sud
+        
+        # self.env.cur_pos = random.choice(initial_pos)
+
+        # self.env.cur_angle = 0.0
+
+        # self.env.unwrapped.step(np.array([0, 0]))
+                               
         return initial_obs, {} 
 
     def tile_one_hot(self, tile_kind):
-        tile_types = ['straight', 'curve_left', 'curve_right', '3way_left', '3way_right', '4way']
+        tile_types = ['straight', 'curve_left', '3way_left', '4way']
         one_hot = np.zeros(len(tile_types), dtype=np.float32)
         if tile_kind in tile_types:
             idx = tile_types.index(tile_kind)
             one_hot[idx] = 1.0
         return one_hot
 
+    def action_one_hot(self, direzione):
+        action_types = ['left', 'right', 'straight']
+        one_hot = np.zeros(len(action_types), dtype=np.float32)
+        if direzione in action_types:
+            idx = action_types.index(direzione)
+            one_hot[idx] = 1.0
+        return one_hot
+    
+    def bezier_curve(self, points, n_points=100):
+        """
+        Genera una curva Bézier cubica da 4 punti di controllo.
+
+        Args:
+            points (np.ndarray): Array shape (4, 3) con i punti di controllo (in 3D).
+            n_points (int): Numero di punti da generare lungo la curva.
+
+        Returns:
+            np.ndarray: Array shape (n_points, 3) con i punti lungo la curva.
+        """
+        assert points.shape == (4, 3), "Sono richiesti esattamente 4 punti di controllo in 3D"
+
+        t = np.linspace(0, 1, n_points).reshape(-1, 1)  # Shape (n_points, 1)
+        
+        # Formula Bézier cubica:
+        curve = (1 - t)**3 * points[0] + \
+                3 * (1 - t)**2 * t * points[1] + \
+                3 * (1 - t) * t**2 * points[2] + \
+                t**3 * points[3]
+        
+        return curve
+    
     def step(self, action):
+
+        flag = None
         
         obs_to_return = self.last_obs if self.last_obs is not None else np.zeros(self.env.observation_space.shape, dtype=np.float32)
+        
+        # print("metodo step")
 
-        if self.post_goal_counter is not None:
-            self.post_goal_counter += 1
-            if self.post_goal_counter >= 200:
-                done = True
-                info = {"post_goal_timeout": True}
-                reward, done_extra, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
-                return obs, reward, done, False, info
-            else:
-                reward, _, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
-                return obs, reward, False, False, info
+        # commentata per fase test
+        # if self.post_goal_counter is not None:
+            # self.post_goal_counter += 1
+            # if self.post_goal_counter >= 200:
+                # done = True
+                # info = {"post_goal_timeout": True}
+                # reward, done_extra, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
+                # return obs, reward, done, False, info
+            # else:
+                # reward, _, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
+                # return obs, reward, False, False, info
 
         action_map = {
             0: (0.0, 0.3), 1: (0.1, 0.3), 2: (0.2, 0.3), 3: (0.3, 0.3),
@@ -319,39 +439,43 @@ class DuckieRLWrapper(gym.Env):
         }
         vl, vr = action_map[int(action)]
 
+
         raw_obs, _, done_env, info = self.env.step(np.array([vl, vr]))
 
         self.num_steps += 1
 
-        obs = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32) # Valori default, adatta la dimensione
+        # obs = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32) # Valori default, adatta la dimensione
 
         img = self.env.render('rgb_array')
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         obs_img = cv2.resize(img, (400, 300))
-        # Placeholder per stop_line_detected - adattalo alla tua implementazione
-        # def stop_line_detected(img):
-            # return False
-        # stop_flag = 1.0 if stop_line_detected(obs_img) else 0.0
 
         try:
             self.lane_pos = self.env.get_lane_pos2(self.env.cur_pos, self.env.cur_angle)
             lateral = self.lane_pos.dist
-            angle = self.lane_pos.angle_deg / 180.0
+            angle = self.lane_pos.angle_rad # / 180.0
             lane_position = self.lane_pos
             dot_dir = self.lane_pos.dot_dir
-        except:
-            done = True
-            # self.lane_pos = None
-            # lane_position = None
-            # lateral, angle, dot_dir = 0.0, 0.0, 0.0
+            pos = self.env.unwrapped.cur_pos
+            curr_i, curr_j = self.env.unwrapped.get_grid_coords(pos)
+            self.current_tile = (curr_i, curr_j)
+            reward = 0.0
 
-        delta_lateral = 0.0
-        if self.prev_lateral is not None and not self.in_intersection and lane_position is not None:
-            delta_lateral = abs(self.lane_pos.dist - self.prev_lateral)
-        
-        self.prev_lateral = self.lane_pos.dist if self.lane_pos is not None else None
-        self.delta_lateral = delta_lateral  # lo passi implicitamente a reward_straight 
+            tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+            tile_kind = tile_info["kind"] if tile_info else None
+            if tile_kind in ["straight", "curve_left"]:
+                in_intersection = 0
+            else:
+                in_intersection = 1
+        except Exception as e:
+                self.lane_pos = None
+                reward = -1.0  # penalità
+                done = True
+                obs = self.observation_space.sample()  # placeholder o zero array
+                terminated = done  # il tuo "done" logico
+                truncated = False  # oppure True se vuoi gestire timeout
+                return obs, reward, terminated, truncated, {}
 
         # Rilevo posizione e tile correnti
         pos = self.env.unwrapped.cur_pos
@@ -361,83 +485,376 @@ class DuckieRLWrapper(gym.Env):
         tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
         tile_kind = tile_info["kind"] if tile_info else None
 
-        if self.num_steps % 100 == 0 and self.lane_pos is not None:
-            print(f"[DEBUG] step={self.num_steps} | lateral={lateral:.2f}, angle={angle:.2f}, dot_dir={self.lane_pos.dot_dir:.2f}, tile_kind={tile_kind}")
+        # if self.num_steps % 100 == 0 and self.lane_pos is not None:
+            # print(f"[DEBUG] step={self.num_steps} | lateral={lateral:.2f}, angle={angle:.2f}, dot_dir={self.lane_pos.dot_dir:.2f}, tile_kind={tile_kind}")
 
+        # --- Logica per il calcolo della goal_region nell'incrocio ---
+        if self.prev_tile != self.current_tile and self.prev_tile is not None:
 
-        # --- Logica per il calcolo della goal_region ---
-        if self.prev_tile != self.current_tile and self.current_tile in ["3way_left", "3way_right", "4way"]:
-            # Una variazione nella tile è stata rilevata
-            left_turn_result, delta_tile_movement = self.left_turn_available(self.prev_tile, self.current_tile)
+            self.tile_counter += 1
+            print (f"tile passed until now: {self.tile_counter}")
 
-            # Mappatura di delta_tile_movement a angoli assoluti in radianti
-            # Convenzione angoli assoluti: 0=nord, pi/2=ovest, pi=sud, -pi/2=est
-            if delta_tile_movement == (1, 0):    # Movimento nord
-                self.current_road_abs_angle = 0.0 
-            elif delta_tile_movement == (-1, 0): # Movimento sud
-                self.current_road_abs_angle = np.pi 
-            elif delta_tile_movement == (0, - 1):  # Movimento ovest
-                self.current_road_abs_angle = np.pi / 2 
-            elif delta_tile_movement == (0, 1): # Movimento est
-                self.current_road_abs_angle = -np.pi / 2 
-            else:
-                # Se non è un movimento rettilineo (es. transizione in una curva o incrocio con svolta)
-                self.current_road_abs_angle = None #
+            if self.goal_tile is not None:
+                if (self.current_tile == self.goal_tile):
+                    reward += 2.5
+                else:
+                    reward -= 5.0
+                    flag = True
+                    info["wrong_way"] = True
+                    print ("Wrong way!")
 
-            if not left_turn_result:
-                # Se la svolta a sinistra non è permessa, termina e ritorna False
-                # info["left_turn_not_available"] = True
-                pass
-            else:
+            if tile_kind in ["3way_left", "4way"]:
+                in_intersection = 1
+                # print(self.prev_tile, self.current_tile, tile_kind)
+                # Una variazione nella tile è stata rilevata
+                left_turn_result, delta_tile_movement_left = self.left_turn_available(self.prev_tile, self.current_tile)
+                right_turn_result, delta_tile_movement_right = self.right_turn_available(self.prev_tile, self.current_tile)
+                straight_result, delta_tile_movement_straight = self.go_straight(self.prev_tile, self.current_tile)
+
+                chose_direction = []
+                if left_turn_result: chose_direction.append(["left", delta_tile_movement_left])
+                if right_turn_result: chose_direction.append(["right", delta_tile_movement_right])
+                if straight_result: chose_direction.append(["straight", delta_tile_movement_straight])
+
+                self.direzione, delta_tile_movement = random.choice(chose_direction)
+
+                print(f"Previous tile: {self.prev_tile}, current tile: {self.current_tile}, moving with delta: {chose_direction[0][1]}")
+                for i in chose_direction:
+                    print(f"Possible direction {i[0]}")
+
+                print(f"direction chosen: {self.direzione}")
+
+                # Mappatura di delta_tile_movement a angoli assoluti in radianti
+                # Convenzione angoli assoluti: 0=nord, pi/2=ovest, pi=sud, -pi/2=est
+                if delta_tile_movement == (1, 0):    # Movimento nord
+                    self.current_road_abs_angle = 0.0 
+                elif delta_tile_movement == (-1, 0): # Movimento sud
+                    self.current_road_abs_angle = np.pi 
+                elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                    self.current_road_abs_angle = np.pi / 2 
+                elif delta_tile_movement == (0, 1): # Movimento est
+                    self.current_road_abs_angle = -np.pi / 2 
+                else:
+                    # Se non è un movimento rettilineo (es. transizione in una curva o incrocio con svolta)
+                    self.current_road_abs_angle = None #
+
+                if self.direzione == "left":
+                    direzione_left = {
+                        (1, 0): (self.current_tile[0], self.current_tile[1] - 1), # sud-nord
+                        (-1, 0): (self.current_tile[0], self.current_tile[1] + 1), # nord-sud
+                        (0, 1): (self.current_tile[0] + 1, self.current_tile[1]), # ovest-est
+                        (0, -1): (self.current_tile[0] - 1, self.current_tile[1]) # est-ovest                             }
+                        }                   
+                        
+                    if delta_tile_movement in direzione_left:
+                        self.goal_tile = tuple(direzione_left[delta_tile_movement])
+                        tile_size = self.env.road_tile_size
+                        # gx, gy = self.goal_tile                   
+                        # self.goal_center = np.array([gx + 0.5, gy + 0.5]) * tile_size
+                        gx, gy = self.current_tile
+                        if delta_tile_movement == (1, 0):    # Movimento nord
+                            self.goal_center = np.array([gx + 0.7, gy]) * tile_size
+                        elif delta_tile_movement == (-1, 0): # Movimento sud
+                            self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size 
+                        elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                            self.goal_center = np.array([gx, gy + 0.3]) * tile_size
+                        elif delta_tile_movement == (0, 1): # Movimento est
+                            self.goal_center = np.array([gx + 1.0, gy + 0.7]) * tile_size 
+
+                if self.direzione == "right":
+                    direzione_right = {
+                        (1, 0): (self.current_tile[0], self.current_tile[1] + 1), # sud-nord
+                        (-1, 0): (self.current_tile[0], self.current_tile[1] - 1), # nord-sud
+                        (0, 1): (self.current_tile[0] - 1, self.current_tile[1]), # ovest-est
+                        (0, -1): (self.current_tile[0] + 1, self.current_tile[1]) # est-ovest 
+                        }
+                        
+                    if delta_tile_movement in direzione_right:
+                        self.goal_tile = tuple(direzione_right[delta_tile_movement]) 
+                        tile_size = self.env.road_tile_size
+                        # gx, gy = self.goal_tile
+                        gx, gy = self.current_tile
+                        if delta_tile_movement == (1, 0):    # Movimento nord
+                            self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size
+                        elif delta_tile_movement == (-1, 0): # Movimento sud
+                            self.goal_center = np.array([gx + 0.7, gy]) * tile_size 
+                        elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                            self.goal_center = np.array([gx + 1.0, gy + 0.7]) * tile_size
+                        elif delta_tile_movement == (0, 1): # Movimento est
+                            self.goal_center = np.array([gx, gy + 0.3]) * tile_size 
                 
-                direzione = {
-                    (1, 0): (self.current_tile[0], self.current_tile[1] - 1), # sud-nord
-                    (-1, 0): (self.current_tile[0], self.current_tile[1] + 1), # nord-sud
-                    (0, 1): (self.current_tile[0] + 1, self.current_tile[1]), # ovest-est
-                    (0, -1): (self.current_tile[0] - 1, self.current_tile[1]) # est-ovest                             }
-                }                   
+                if self.direzione == "straight":
+                    direzione_straight = {
+                        (1, 0): (self.current_tile[0] + 1, self.current_tile[1]), # sud-nord
+                        (-1, 0): (self.current_tile[0] - 1, self.current_tile[1]), # nord-sud
+                        (0, 1): (self.current_tile[0], self.current_tile[1] + 1), # ovest-est
+                        (0, -1): (self.current_tile[0], self.current_tile[1] - 1) # est-ovest                             
+                        }                   
+                        
+                    if delta_tile_movement in direzione_straight:
+                        self.goal_tile = tuple(direzione_straight[delta_tile_movement])
+                        tile_size = self.env.road_tile_size
+                        gx, gy = self.current_tile
+                        # self.goal_center = np.array([gx + 0.5, gy + 0.5]) * tile_size
+                        if delta_tile_movement == (1, 0):    # Movimento nord
+                            self.goal_center = np.array([gx + 1, gy + 0.7]) * tile_size
+                        elif delta_tile_movement == (-1, 0): # Movimento sud
+                            self.goal_center = np.array([gx, gy + 0.3]) * tile_size 
+                        elif delta_tile_movement == (0, - 1):  # Movimento ovest
+                            self.goal_center = np.array([gx + 0.7, gy]) * tile_size
+                        elif delta_tile_movement == (0, 1): # Movimento est
+                            self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size
+
+                print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}, tyele_tipe: {tile_kind}")
                 
-                if delta_tile_movement in direzione:
-                    self.goal_tile = tuple(direzione[delta_tile_movement])
-                    tile_size = self.env.road_tile_size
-                    gx, gy = self.goal_tile
-                    self.goal_center = np.array([gx + 0.5, gy + 0.5]) * tile_size
-                    print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}")
+                curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
+
+                if curves is not None and len(curves) > 0:
+                    # Estendi goal_center a 3D per confronto (Y=0)
+                    goal_center_3d = np.array([self.goal_center[0], 0, self.goal_center[1]])
+
+                    # Trova la curva che finisce più vicina al centro della goal_tile
+                    self.best_curve = min(curves, key=lambda curve: (
+                            np.linalg.norm(curve[-1] - goal_center_3d) +  # distanza dalla goal
+                            0.5 * np.linalg.norm(curve[0] - self.env.cur_pos)  # distanza dall'attuale posizione
+                        ))
+                    
+                    print(f"Curve choosen: {self.best_curve}")
+
+                    # Salva la curva migliore
+                    self.current_target_curve = self.best_curve
+                else:
+                    self.current_target_curve = None
+                    print("[WARNING] Nessuna curva Bézier trovata nel tile attuale.")
 
         # --- Fine logica per il calcolo della goal_region ---
 
-        # 7️⃣ Distanza normalizzata dalla goal_center (ora calcolata solo se goal_center esiste)
+        # --- Logica per il calcolo della goal_region in curva ---
+            if tile_kind == "curve_left":
+                # print(self.prev_tile, self.current_tile, tile_kind)
+                in_intersection = 0
+                # Una variazione nella tile è stata rilevata
+
+                delta_tile_movement = (curr_i - self.prev_tile[0], (curr_j - self.prev_tile[1]))
+
+                # Mappatura di delta_tile_movement a angoli assoluti in radianti
+                # Convenzione angoli assoluti: 0=nord, pi/2=ovest, pi=sud, -pi/2=est
+                if delta_tile_movement == (1, 0): # movimento nord
+                    self.current_road_abs_angle = 0.0
+                elif delta_tile_movement == (-1, 0): # movimento sud
+                    self.current_road_abs_angle = np.pi
+                elif delta_tile_movement == (0, -1): # movimento ovest
+                    self.current_road_abs_angle = np.pi / 2
+                elif delta_tile_movement == (0, 1): # movimento est
+                    self.current_road_abs_angle = -np.pi / 2
+                else:
+                    # Se non è un movimento rettilineo (es. transizione in una curva o incrocio con svolta)
+                    self.current_road_abs_angle = None #
+
+                direzione = {
+                    (1, (1,0)): (self.current_tile[0], self.current_tile[1] - 1), # curva a sinistra
+                    (2, (1,0)): (self.current_tile[0], self.current_tile[1] + 1), # curva a destra
+                    (0, (-1,0)): (self.current_tile[0], self.current_tile[1] - 1), # curva a destra
+                    (3, (-1,0)): (self.current_tile[0], self.current_tile[1] + 1), # curva a sinistra
+                    (1, (0,1)): (self.current_tile[0] - 1, self.current_tile[1]), # curva a destra
+                    (0, (0,1)): (self.current_tile[0] + 1, self.current_tile[1]), # curva a sinistra
+                    (2, (0,-1)): (self.current_tile[0] - 1, self.current_tile[1]), # curva a sinistra
+                    (3, (0,-1)): (self.current_tile[0] + 1, self.current_tile[1]) # curva a destra
+                }
+
+                possible_curve = {
+                    (1, (1,0)): "left_curve",
+                    (2, (1,0)): "right_curve",
+                    (0, (-1,0)): "right_curve",
+                    (3, (-1,0)): "left_curve",
+                    (1, (0,1)): "right_curve",
+                    (0, (0,1)): "left_curve",
+                    (2, (0,-1)): "left_curve",
+                    (3, (0,-1)): "right_curve"
+                }             
+                                    
+                if (tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1])) in direzione:
+                    self.goal_tile = tuple(direzione[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))])
+                    tile_size = self.env.road_tile_size
+                    gx, gy = self.current_tile
+
+                    if delta_tile_movement == (1, 0) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "left_curve":
+                        self.goal_center = np.array([gx + 0.7, gy]) * tile_size    # Movimento nord
+                    if delta_tile_movement == (-1, 0) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "left_curve":
+                        self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size    # Movimento sud
+                    if delta_tile_movement == (0, -1) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "left_curve":
+                        self.goal_center = np.array([gx, gy + 0.3]) * tile_size    # Movimento ovest
+                    if delta_tile_movement == (0, 1) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "left_curve":
+                        self.goal_center = np.array([gx + 1.0, gy + 0.7]) * tile_size    # Movimento est
+                    if delta_tile_movement == (1, 0) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "right_curve":
+                        self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size    # Movimento nord
+                    if delta_tile_movement == (-1, 0) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "right_curve":
+                        self.goal_center = np.array([gx + 0.7, gy]) * tile_size    # Movimento sud
+                    if delta_tile_movement == (0, -1) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "right_curve":
+                        self.goal_center = np.array([gx + 1.0, gy + 0.7]) * tile_size    # Movimento ovest
+                    if delta_tile_movement == (0, 1) and possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))] == "right_curve":
+                        self.goal_center = np.array([gx, gy + 0.3]) * tile_size    # Movimento est
+                    print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}")
+
+                if (tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1])) in possible_curve:
+                    self.curve_type = possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))]
+                    self.direzione = "left" if self.curve_type == "left_curve" else "right"
+
+                curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
+
+                if curves is not None and len(curves) > 0:
+                    # posizione goal_center (x, 0, z)
+                    goal_center_3d = np.array([self.goal_center[0], 0, self.goal_center[1]])
+
+                    self.best_curve = min(curves, key=lambda curve: (
+                            np.linalg.norm(curve[-1] - goal_center_3d) +  # distanza dalla goal
+                            0.5 * np.linalg.norm(curve[0] - self.env.cur_pos)  # distanza dall'attuale posizione
+                        ))
+                    
+                    print(f"Curve choosen: {self.best_curve}")
+
+                    # Salva la curva migliore
+                    self.current_target_curve = self.best_curve
+                else:
+                    self.current_target_curve = None
+                    print("[WARNING] Nessuna curva Bézier trovata nel tile attuale.")
+
+        # --- Fine logica per il calcolo della goal_region ---
+
+        # --- Calcolo della migliore curva da seguire su un rettilineo ---
+            if self.tile_counter == 1 and tile_kind == "straight":
+
+                curves = curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
+
+                if curves is not None and len(curves) > 0:
+
+                    # Trova la curva che finisce più al punto di partenza (parte da rettilineo)
+                    self.best_curve = min(curves, key=lambda curves: (
+                            np.linalg.norm(curves[0] - self.env.cur_pos)  # distanza dall'attuale posizione
+                            ))
+                    
+                    print(f"Curve choosen: {self.best_curve}")
+                
+                    self.current_target_curve = self.best_curve
+                else:
+                    self.current_target_curve = None
+                    print("[WARNING] Nessuna curva Bézier trovata nel tile attuale.")
+
+                
+            if self.tile_counter > 1 and tile_kind == "straight":
+                self.direzione = "straight"
+
+                delta_tile_movement = tuple([self.current_tile[0] - self.prev_tile[0], self.current_tile[1] - self.prev_tile[1]])
+                print (self.current_tile, self.prev_tile)
+
+                tile_size = self.env.road_tile_size
+
+                gx = self.current_tile[0]
+                gy = self.current_tile[1]
+
+                if delta_tile_movement == (1, 0): # movimento nord
+                    self.goal_tile = tuple([self.current_tile[0] + 1, self.current_tile[1]])
+                    self.goal_center = np.array([gx + 1.0, gy + 0.7]) * tile_size
+                if delta_tile_movement == (-1, 0): # movimento sud
+                    self.goal_tile = tuple([self.current_tile[0] - 1 , self.current_tile[1]])
+                    self.goal_center = np.array([gx, gy + 0.3]) * tile_size
+                if delta_tile_movement == (0, -1): # movimento ovest
+                    self.goal_tile = tuple([self.current_tile[0], self.current_tile[1] - 1])
+                    self.goal_center = np.array([gx + 0.7, gy]) * tile_size
+                if delta_tile_movement == (0, 1): # movimento est
+                    self.goal_tile = tuple([self.current_tile[0], self.current_tile[1] + 1])
+                    self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size
+
+                print(f"Goal tile calcolata: {self.goal_tile}, Goal point: {self.goal_center}")
+
+                curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
+
+                print (f"available curves: {curves}")
+
+                if curves is not None and len(curves) > 0:
+                    # Estendi goal_center a 3D per confronto (Y=0)
+                    goal_center_3d = np.array([self.goal_center[0], 0, self.goal_center[1]])
+
+                    # Trova la curva che finisce più vicina al centro della goal_tile
+                    self.best_curve = min(curves, key=lambda curves: (
+                                np.linalg.norm(curves[-1] - goal_center_3d) +  # distanza dalla goal
+                                0.5 * np.linalg.norm(curves[0] - self.env.cur_pos)  # distanza dall'attuale posizione
+                            ))
+                    
+                    print(f"Curve choosen: {self.best_curve}")
+
+                        
+                    self.current_target_curve = self.best_curve
+                else:
+                    self.current_target_curve = None
+                    print("[WARNING] Nessuna curva Bézier trovata nel tile attuale.")
+
+        if self.best_curve is None:
+            curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
+
+            if curves is not None and len(curves) > 0:
+
+                # Trova la curva che finisce più al punto di partenza (parte da rettilineo)
+                self.best_curve = min(curves, key=lambda curves: (
+                        np.linalg.norm(curves[0] - self.env.cur_pos)  # distanza dall'attuale posizione
+                        ))
+                
+                self.current_target_curve = self.best_curve
+
+        # 7️⃣ Distanza normalizzata dalla goal_center (usata solo se esiste un goal)
+        tile_size = self.env.road_tile_size
         dist_to_goal = 0.0
+
+        try:
+            # Calcolo dei punti della curva Bézier
+            curve_points = self.bezier_curve(self.current_target_curve, n_points=100)  # (100, 3)
+
+            # Prendi solo le coordinate X,Y (ignora Z)
+            curve_xy = curve_points[:, [0, 2]]  # shape (100, 2)
+
+            # Posizione attuale dell'agente (X,Z)
+            agent_pos = np.array([self.env.cur_pos[0], self.env.cur_pos[2]])
+
+            # Calcola le distanze da tutti i punti della curva
+            dists = np.linalg.norm(curve_xy - agent_pos, axis=1)
+
+            # Trova la distanza minima
+            min_dist = np.min(dists)
+
+            # Normalizza rispetto alla metà della corsia
+            self.normalized_dist = min_dist / (self.lane_width / 2.0)
+
+            # Penalità proporzionale alla distanza
+            # reward -= normalized_dist
+
+            # print (f"distance from the curve: {self.normalized_dist}")
+
+        except Exception as e:
+            print(f"[ERROR] Errore nel calcolo della reward Bézier: {e}")
+            # Eventualmente penalizza
+
         if self.goal_center is not None:
             pos2d = np.array(self.env.cur_pos)[[0, 2]]
             dist_to_goal = np.linalg.norm(pos2d - self.goal_center)
+            dist_norm = dist_to_goal / (np.sqrt(2) * tile_size)  # valore ∈ [0, 1] in teoria
         else:
-            dist_to_goal = 1.0
-        tile_size = self.env.road_tile_size
-        dist_norm = dist_to_goal / (2 * tile_size)
+            dist_norm =  1.0  # corretto perchè ci sia sempre un goal da raggiungere meno all'inizio
 
         # 8️⃣ Composizione osservazione vettoriale
         obs = np.concatenate([
-            np.array([lateral, angle, dist_norm, dot_dir], dtype=np.float32),  # 3 valori continui
-            self.tile_one_hot(tile_kind)                         # 6 valori one-hot
+            np.array([lateral, angle, dist_norm, self.normalized_dist], dtype=np.float32),  # 4 valori continui
+            self.tile_one_hot(tile_kind),                       # 4 valori one-hot
+            self.action_one_hot(self.direzione)                 # 3 valori one-hot per direzione                         
         ])
-
-
-        # 4️⃣ Gestione flag intersection (solo se left_turn_allowed è True e goal_tile è stata calcolata)
-        if tile_kind in ["3way_left", "4way", "3way_right"] and self.left_turn_allowed and self.goal_tile is not None:
-            center = np.array([curr_i + 0.5, curr_j + 0.5]) # Usa curr_i, curr_j
-            pos2d = np.array(self.env.cur_pos)[[0, 2]] # Usa la posizione corrente
-            d2c = np.linalg.norm(pos2d - center)
-            if d2c < 0.25:
-                self.in_intersection = True
-            if d2c > 0.5 and getattr(self, "in_intersection", False):
-                self.in_intersection = False
-                self.crossed_intersection = True
-        # else:
-            # vl, vr = action_map[3]  # forzi dritto
 
         # 9️⃣ Calcolo reward e done_extra
         reward, done_extra, info_extra = self.compute_reward(action, obs)
+
+        if self.num_steps % 100 == 0 and self.lane_pos is not None:
+            print(f"[DEBUG] step={self.num_steps} | lateral={lateral:.2f}, angle={angle:.2f}, dot_dir={self.lane_pos.dot_dir:.2f}")
+            print(f"tile_kind={tile_kind}, reward={reward:.2f}, distance from the curve choosen: {self.normalized_dist}")
+            if self.goal_center is not None:
+                print(f" Distance from the goal: {dist_norm}")
 
         # 🔟 Condizioni di terminazione
         done = done_env
@@ -451,15 +868,9 @@ class DuckieRLWrapper(gym.Env):
             done = True
             info['out_of_road'] = True
 
-        # 10.2 Goal raggiunto via tile
-        # Controlla solo se goal_tile è stata impostata
-        if self.goal_tile is not None and self.current_tile == self.goal_tile and self.post_goal_counter is None:
-            self.post_goal_counter = 0
-
-        # 10.3 Attraversamento incrocio
-        if getattr(self, "crossed_intersection", False):
+        if self.tile_counter > 5:
+            reward += 10.0  # arrivato alla fine del percorso
             done = True
-            info['crossed_intersection'] = True
 
         # 10.4 Altre condizioni definite da compute_reward
         done = done or done_extra
@@ -471,6 +882,9 @@ class DuckieRLWrapper(gym.Env):
         # Aggiorna prev_tile per il prossimo step
         self.prev_tile = self.current_tile
         self.last_obs = obs
+
+        if flag is not None and flag == True:
+            done = True
 
         return obs, reward, done, False, info
 
@@ -486,100 +900,194 @@ class DuckieRLWrapper(gym.Env):
             return obs
 
     def reward_straight(self, action, obs):
-        lateral, angle, dist_norm, dot_dir = obs[:4]
-        tile_one_hot = obs[4:]
+        lateral, angle, dist_norm, dist_curve = obs[:4]
+        tile_one_hot = obs[4:8]
+        action_one_hot = obs[8:]
         reward = 0.0
 
-        # 1. Penalità per offset laterale dalla corsia
-        reward -= abs(lateral) * 3.0
+        # if self.current_target_curve is None or self.tile_counter < 2:
+            # print("[WARNING] self.current_target_curve è None, salta reward Bézier.")
+                    # 1. Penalità per offset laterale dalla corsia
+            # if -0.105 <= lateral <= 0.105:
+                # reward -= abs(lateral) / 0.105   # normalizzato [-1,0]
+            # else:
+                # sei fuori corsia → chiudi episodio
+                # reward -= 5.0
+                # done = True
+                # info_extra = {"wrong lane": True}
+            # reward -= abs(angle)/self.max_angle
+            # if  -0.02 <= angle <= 0.02:
+                # reward += 1.0
+            # elif angle <= -1 or angle >= 1:
+                # reward -= 5.0
+                # done = True
+                # info_extra = {"wrong angle": True} 
+            # return reward  # ritorna il reward calcolato finora
 
-        if dot_dir < 0.0:
-            dot_dir *= -1
+        if self.goal_center is not None:
+            if (self.prev_dist_to_goal - dist_norm) <=0:
+                reward -= 3.0 # the agent stays still or it is moving away from the goal
 
-        # 2. Premia l'allineamento alla corsia
+            else:
+                reward += self.prev_dist_to_goal - dist_norm
 
-        reward += 10.0 * (dot_dir ** 3)  # più centrato, più alto il reward
+            if dist_norm < 0.15:
+                reward += 1.5
+                info_extra = {"near the goal": True}
         
-        # if not self.in_intersection:
-            # reward += 5 * dot_dir  # più centrato, più alto il reward
-            # if dot_dir > 0.98:
-                # reward += 3.0 * dot_dir
+        self.prev_dist_to_goal = dist_norm
 
-        # 5. Bonus extra se perfettamente centrato, orientato e dritto
-        # if abs(lateral) < 0.005 and dot_dir > 0.99 and action == 3:
-            # reward += 7.0
+        if (self.prev_dist_curve - dist_curve) <= 0:
+            reward = -3.0 # the agent stays still or it is moving away from the correct curve
+        else:
+            reward += dist_curve - self.prev_dist_curve
 
+        self.prev_dist_curve = dist_curve
 
-        # 6. Penalità per oscillazioni laterali (variazione da step precedente)
-        if hasattr(self, "delta_lateral") and not self.in_intersection:
-            reward -= 3.0 * self.delta_lateral
+        reward += dist_curve - self.prev_dist_curve
+        self.prev_dist_curve = dist_curve
 
+        if lateral < -0.105 or lateral > 0.105:
+            reward -= 5.0
+            # done = True
+            # info_extra = {"out_of_lane": True}
+            # return reward
+
+        if angle < -1.0 or angle > 1.0:
+            reward -= 5.0
+            # done = True
+            # info_extra = {"wrong_angle": True}
+            # return reward
+        
         return reward
 
     def reward_curve(self, action, obs):
 
-        lateral, angle, dist_norm, dot_dir = obs[:4]
-        tile_one_hot = obs[4:]
+        lateral, angle, dist_norm, dist_curve = obs[:4]
+        tile_one_hot = obs[4:8]
+        action_one_hot = obs[8:]
+        reward = 0.0
 
         tile_kind_idx = int(np.argmax(tile_one_hot))
         tile_kind = self.tile_kinds[tile_kind_idx]
 
-        reward = 0.0
-        reward -= abs(lateral) * 10.0
-        # reward -= abs(min(0, lateral)) * 2.0
-        #if angle > 0.1: reward -= 3.0
-        #elif -0.1 < angle <= 0.1: reward -= 1.0
-        #elif angle < -0.2: reward += 1.0  # bonus per buona sterzata
+        action_one_hot_idx = int(np.argmax(action_one_hot))
+        action = self.action_types[action_one_hot_idx]
 
-        #elif tile_kind == "curve_right":
-        #reward -= min(0, lateral) * 5.0
-        #reward -= abs(max(0, lateral)) * 2.0
-        #if angle < -0.1: reward -= 3.0
-        #elif -0.1 <= angle < 0.1: reward -= 1.0
-        #elif angle > 0.2: reward += 1.0
+        reward = 0.0
+        # reward -= abs(lateral)/ self.max_offset
+
+        if (self.prev_dist_to_goal - dist_norm) <=0:
+            reward -= 3.0 # the agent stays still or it is moving away from the goal
+
+        else:
+            reward += self.prev_dist_to_goal - dist_norm
+        
+        self.prev_dist_to_goal = dist_norm
+
+        if (self.prev_dist_curve - dist_curve) <= 0:
+            reward = -3.0 # the agent stays still or it is moving away from the correct curve
+        else:
+            reward += dist_curve - self.prev_dist_curve
+
+        self.prev_dist_curve = dist_curve
+
+            # Eventualmente penalizza
+            # reward -= 1.0
+
+        if dist_norm < 0.15:
+            reward += 1.5
+            info_extra = {"near the goal": True}
 
         return reward
     
     def reward_intersection(self, action, obs):
-        lateral, angle, dist_norm, dot_dir = obs[:4]
-        tile_one_hot = obs[4:]
+        lateral, angle, dist_norm, dist_curve = obs[:4]
+        tile_one_hot = obs[4:8]
+        action_one_hot = obs[8:]
         reward = 0.0
-        reward -= 3.0 * abs(lateral)
 
-        if action in [3, 4, 5, 6]:
-            reward -= 6.0
-        elif action == 0:  # sinistra
-            reward += 6.0
-        # else:
-           #reward -= abs(angle) * 0.2
+        if (self.prev_dist_to_goal - dist_norm) <=0:
+            reward -= 3.0 # the agent stays still or it is moving away from the goal
 
-        delta = self.prev_dist_to_goal - dist_norm
-        reward += delta * 5.0
+        else:
+            reward += self.prev_dist_to_goal - dist_norm
+        
         self.prev_dist_to_goal = dist_norm
 
-        # if abs(lateral) > 0.4:
-            # reward -= 5.0
+        if (self.prev_dist_curve - dist_curve) <= 0:
+            reward = -3.0 # the agent stays still or it is moving away from the correct curve
+        else:
+            reward += dist_curve - self.prev_dist_curve
 
+        self.prev_dist_curve = dist_curve
+
+        # Controlla se la curva è valida
+        # if self.current_target_curve is None:
+            # print("[WARNING] self.current_target_curve è None, salta reward Bézier.")
+            # return reward  # ritorna il reward calcolato finora
+
+        # try:
+            # Calcolo dei punti della curva Bézier
+            # curve_points = self.bezier_curve(self.current_target_curve, n_points=100)  # (100, 3)
+
+            # Prendi solo le coordinate X,Y (ignora Z)
+            # curve_xy = curve_points[:, [0, 2]]  # shape (100, 2)
+
+            # Posizione attuale dell'agente (X,Z)
+            # agent_pos = np.array([self.env.cur_pos[0], self.env.cur_pos[2]])
+
+            # Calcola le distanze da tutti i punti della curva
+            # dists = np.linalg.norm(curve_xy - agent_pos, axis=1)
+
+            # Trova la distanza minima
+            # min_dist = np.min(dists)
+
+            # Normalizza rispetto alla metà della corsia
+            # normalized_dist = min_dist / (self.lane_width / 2.0)
+
+            # Penalità proporzionale alla distanza
+            # reward -= normalized_dist
+
+            #print (f"distance from the curve: {normalized_dist}")
+
+        # except Exception as e:
+            # print(f"[ERROR] Errore nel calcolo della reward Bézier: {e}")
+            # Eventualmente penalizza
+        
+        if dist_norm < 0.15:
+            reward += 1.5
+            info_extra = {"near the goal": True}
         return reward
 
     def compute_reward(self, action, obs):
-        import numpy as np
 
-        lateral, angle, dist_norm, dot_dir = obs[:4]
-        tile_one_hot = obs[4:]
+        lateral, angle, dist_norm, dist_curve = obs[:4]
+        tile_one_hot = obs[4:8]
+        action_one_hot = obs[8:]
+        reward = 0.0
         done = False
         info_extra = {}
         reward = 0.0
 
-        if lateral > 0.12 or lateral < - 0.35:
-            return -20.0, True, {"out_of_lane": True}
-        
         start_tile = self.env.unwrapped.get_grid_coords(self.env.cur_pos)
         i, j = start_tile
 
         tile_kind_idx = int(np.argmax(tile_one_hot))
         tile_kind = self.tile_kinds[tile_kind_idx]
         agent_abs_angle = self.env.unwrapped.cur_angle
+
+        pos = self.env.unwrapped.cur_pos
+        curr_i, curr_j = self.env.unwrapped.get_grid_coords(pos)
+        self.current_tile = (curr_i, curr_j)
+
+        tile_info = self.env.unwrapped._get_tile(curr_i, curr_j)
+ 
+        if self.lane_pos is None or not tile_info['drivable']:
+            reward = -10.0
+            done = True
+            info_extra["out_of_lane"] = True
+            return reward, done, info_extra
 
         if not hasattr(self, "prev_dist_to_goal"):
             self.prev_dist_to_goal = dist_norm
@@ -589,135 +1097,20 @@ class DuckieRLWrapper(gym.Env):
             reward = self.reward_straight(action, obs)
         elif tile_kind in ["curve_left", "curve_right"]:
             reward += self.reward_curve(action, obs)
+            # print(obs)
+            self.prev_dist_to_goal = dist_norm
         elif tile_kind in ["3way_left", "3way_right", "4way"]:
             reward += self.reward_intersection(action, obs)
             self.prev_dist_to_goal = dist_norm
 
-        # Penalità per oscillazione
-        if self.last_action in [0, 2] and action in [0, 2] and self.last_action != action:
-            self.oscillation_count += 1
-        else:
-            self.oscillation_count = 0
-        self.last_action = action
-        if self.oscillation_count >= 3:
-            reward -= 1.0
-
         # Raggiunto obiettivo
         if start_tile == self.goal_tile:
-            reward += 50.0
-            done = True
+            reward += 5.0
+            # done = True
+            done = False # solo per test
             info_extra["goal_reached"] = True
 
         return reward, done, info_extra
-
-class LaneFollower:
-    def __init__(self, kp=0.8, ki=0.0, kd=0.2,
-                 target_speed=0.3, min_speed=0.1,
-                 max_omega=1.0):
-        # PID gains
-        self.kp = kp
-        # Permette al robot di correggere rapidamente la sua traiettoria quando si allontana dalla linea
-
-        self.ki = ki 
-        #  Consente al robot di correggere derive lente o errori sistematici che il solo controllo
-        #  proporzionale non riuscirebbe ad eliminare completamente.
-
-        self.kd = kd
-        # Aiuta a prevenire un'eccessiva correzione anticipando il comportamento futuro dell'errore. 
-
-        # PID state
-        self.integral = 0.0
-        self.last_error = 0.0
-        # Low-pass filter for derivative term
-        self.deriv_filtered = 0.0
-        self.alpha = 0.1  # filter weight
-        # Speed settings
-        self.target_speed = target_speed # Imposta la velocità di crociera del robot
-        self.min_speed = min_speed  # fallback speed when lane is lost
-        # Steering limit
-        self.max_omega = max_omega # Previene sterzate eccessive e potenzialmente instabili
-
-    def process(self, image, dt):
-        """
-        Main pipeline: image -> (v_linear, omega)
-        If lane is detected: PID control.
-        If lane lost: maintain straight at min_speed.
-        """
-        error = self.calculate_lane_error(image)
-        if error is None:
-            # Lane lost: vai piano e sterza verso l'ultima direzione nota
-            steer = np.clip(getattr(self, 'last_error', 0.0), -self.max_omega, self.max_omega)
-            return float(self.min_speed), steer
-
-        # Lane detected: normal PID
-        speed = self.target_speed
-        if abs(error) > 0.5:
-            speed *= 0.3  # reduce speed in tight turns
-            kp = self.kp * 1.5 # aumenta temporaneamente il guadagno proporzionale
-        else:
-            kp = self.kp
-
-        speed = max(self.min_speed, speed)
-
-        # PID con guadagno proporzionale adattivo
-
-        # CALCOLA OMEGA USANDO IL PID COMPLETO
-        # Aggiorna integral e deriv_filtered all'interno di compute_control o qui
-        self.integral += error * dt # Aggiorna il termine integrale
-        deriv = (error - self.last_error) / dt if dt > 1e-6 else 0.0
-        self.deriv_filtered = self.alpha * deriv + (1 - self.alpha) * self.deriv_filtered # Aggiorna il termine derivativo filtrato
-
-        omega = kp * error + self.ki * self.integral + self.kd * self.deriv_filtered
-        omega = float(np.clip(omega, -self.max_omega, self.max_omega))
-        self.last_error = error
-        return float(self.min_speed), omega
-
-    def calculate_lane_error(self, image):
-        """
-        Compute lateral deviation error:
-         1) ROI mask to remove off-road
-         2) HSV threshold for yellow & white lanes
-         3) Morphological closing
-         4) Bird's-eye warp
-         5) Canny edges & centroid
-        Returns error in [-1,1] or None if no line.
-        """
-        h, w = image.shape[:2]
-        # ROI: metà destra
-        right_half = image[:, int(w*0.5):]
-
-        # HSV threshold per bianco (linea continua destra)
-        hsv = cv2.cvtColor(right_half, cv2.COLOR_RGB2HSV)
-        white = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 30, 255]))
-
-        # Morphology
-        blur = cv2.GaussianBlur(white, (5,5), 0)
-        kernel = np.ones((5,5), np.uint8)
-        clean = cv2.morphologyEx(blur, cv2.MORPH_CLOSE, kernel)
-
-        # Centroid della linea bianca
-        M = cv2.moments(clean)
-        if M['m00'] > 0:
-            cx = M['m10'] / M['m00']
-            # Errore rispetto al bordo destro (non al centro!)
-            error = (cx - (right_half.shape[1] - 1)) / (right_half.shape[1] - 1)
-            self.last_error = error
-            return float(error)
-        return None
-
-    def compute_control(self, error, dt):
-        """
-        PID control with filtered derivative.
-        dt: time interval.
-        """
-        # Integral
-        self.integral += error * dt
-        # Derivative
-        deriv = (error - self.last_error) / dt if dt > 1e-6 else 0.0
-        self.deriv_filtered = self.alpha * deriv + (1 - self.alpha) * self.deriv_filtered
-        # PID output
-        omega = self.kp * error + self.ki * self.integral + self.kd * self.deriv_filtered
-        return omega
 
 class RewardHistoryCallback(BaseCallback):
     def __init__(self, reward_history, verbose=0):
@@ -772,7 +1165,7 @@ def main():
             camera_rand=False,
             dynamics_rand=False,
             randomize_maps_on_reset=False,
-            # user_tile_start=tile,
+            user_tile_start= (1,2),
   
         )
 
@@ -789,16 +1182,16 @@ def main():
     model = DQN(
         policy="MlpPolicy",
         env=env,
-        learning_rate=1e-5,
+        learning_rate=1e-4,
         buffer_size=100_000,               # AUMENTATO
         learning_starts=10000,              # Parte dopo aver riempito un po' di buffer
         batch_size=64, 
-        tau=0.005,                           # Soft update, può restare così
+        tau=0.005,                 
         gamma=0.99,
         train_freq=4,
-        gradient_steps=2,
+        gradient_steps=4,
         target_update_interval=1000,
-        exploration_fraction=0.1,
+        exploration_fraction=0.3,
         exploration_final_eps=0.01,
         verbose=1,
         # tensorboard_log="./dqn_duckie_tensorboard/"
@@ -808,7 +1201,7 @@ def main():
 
     # Avvia il training vero
     # Training in modalità batch
-    num_batches = 5
+    num_batches = 10
     timesteps_per_batch = 100000
 
     # Lista per memorizzare le ricompense episodiche
@@ -830,6 +1223,7 @@ def main():
 
             # Se è il miglior risultato, salva il modello
             if mean_ep_reward > best_avg_reward:
+
                 best_avg_reward = mean_ep_reward
                 model.save(best_model_path)
                 print(f"✅ Nuovo best model salvato con reward media: {mean_ep_reward:.2f}")
