@@ -808,8 +808,6 @@ class DuckieRLWrapper(gym.Env):
         try:
             # Calcolo dei punti della curva Bézier
             curve_points = self.bezier_curve(self.current_target_curve, n_points=100)  # (100, 3)
-            for i in (curve_points):
-                print (i)
 
             # Prendi solo le coordinate X,Y (ignora Z)
             curve_xy = curve_points[:, [0, 2]]  # shape (100, 2)
