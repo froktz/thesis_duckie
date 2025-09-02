@@ -52,6 +52,8 @@ class DuckieRLWrapper(gym.Env):
         
         # self.env.cur_pos = random.choice(initial_pos)
 
+
+
         # self.env.cur_angle = 0.0
 
         self.tile_counter = 0
@@ -125,6 +127,8 @@ class DuckieRLWrapper(gym.Env):
         self.current_tile_kind = None  # Inizializza a None o un valore di default appropriato
         self.current_left_turn_result = True # Inizializza a True come default
         self.current_delta_tile_movement = None # Inizializza a None
+
+        self.cur_pos = [0.73125, 0.,      1.5795 ]
 
     def seed(self, seed=None):
 
@@ -370,6 +374,8 @@ class DuckieRLWrapper(gym.Env):
 
         # self.env.cur_angle = 0.0
 
+        self.cur_pos = [0.73125, 0.,      1.5795 ]
+
         # self.env.unwrapped.step(np.array([0, 0]))
                                
         return initial_obs, {} 
@@ -419,20 +425,6 @@ class DuckieRLWrapper(gym.Env):
         
         obs_to_return = self.last_obs if self.last_obs is not None else np.zeros(self.env.observation_space.shape, dtype=np.float32)
         
-        # print("metodo step")
-
-        # commentata per fase test
-        # if self.post_goal_counter is not None:
-            # self.post_goal_counter += 1
-            # if self.post_goal_counter >= 200:
-                # done = True
-                # info = {"post_goal_timeout": True}
-                # reward, done_extra, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
-                # return obs, reward, done, False, info
-            # else:
-                # reward, _, info_extra = self.compute_reward(action, None, None, None, None) # Adatta gli argomenti
-                # return obs, reward, False, False, info
-
         action_map = {
             0: (0.0, 0.3), 1: (0.1, 0.3), 2: (0.2, 0.3), 3: (0.3, 0.3),
             4: (0.3, 0.2), 5: (0.3, 0.1), 6: (0.3, 0.0),
@@ -606,6 +598,8 @@ class DuckieRLWrapper(gym.Env):
                             self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size
 
                 print(f"Goal tile calcolata: {self.goal_tile}, Goal center: {self.goal_center}, tyele_tipe: {tile_kind}")
+
+                print ("evaluating new curve")
                 
                 curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
 
@@ -700,6 +694,8 @@ class DuckieRLWrapper(gym.Env):
                     self.curve_type = possible_curve[(tile_info["angle"], (curr_i - self.prev_tile[0], curr_j - self.prev_tile[1]))]
                     self.direzione = "left" if self.curve_type == "left_curve" else "right"
 
+                print ("evaluating new curve")
+
                 curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
 
                 if curves is not None and len(curves) > 0:
@@ -724,6 +720,8 @@ class DuckieRLWrapper(gym.Env):
         # --- Calcolo della migliore curva da seguire su un rettilineo ---
             if self.tile_counter == 1 and tile_kind == "straight":
 
+                print ("evaluating new curve")
+
                 curves = curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
 
                 if curves is not None and len(curves) > 0:
@@ -745,7 +743,7 @@ class DuckieRLWrapper(gym.Env):
                 self.direzione = "straight"
 
                 delta_tile_movement = tuple([self.current_tile[0] - self.prev_tile[0], self.current_tile[1] - self.prev_tile[1]])
-                print (self.current_tile, self.prev_tile)
+                print(f"Previous tile: {self.prev_tile}, current tile: {self.current_tile}, moving with delta: {delta_tile_movement}")
 
                 tile_size = self.env.road_tile_size
 
@@ -766,6 +764,8 @@ class DuckieRLWrapper(gym.Env):
                     self.goal_center = np.array([gx + 0.3, gy + 1.0]) * tile_size
 
                 print(f"Goal tile calcolata: {self.goal_tile}, Goal point: {self.goal_center}")
+
+                print ("evaluating new curve")
 
                 curves = self.env._get_curve(self.current_tile[0], self.current_tile[1])
 
@@ -808,6 +808,8 @@ class DuckieRLWrapper(gym.Env):
         try:
             # Calcolo dei punti della curva Bézier
             curve_points = self.bezier_curve(self.current_target_curve, n_points=100)  # (100, 3)
+            for i in (curve_points):
+                print (i)
 
             # Prendi solo le coordinate X,Y (ignora Z)
             curve_xy = curve_points[:, [0, 2]]  # shape (100, 2)
@@ -824,10 +826,7 @@ class DuckieRLWrapper(gym.Env):
             # Normalizza rispetto alla metà della corsia
             self.normalized_dist = min_dist / (self.lane_width / 2.0)
 
-            # Penalità proporzionale alla distanza
-            # reward -= normalized_dist
-
-            # print (f"distance from the curve: {self.normalized_dist}")
+            print (f"distance from the trajectory {self.normalized_dist}")
 
         except Exception as e:
             print(f"[ERROR] Errore nel calcolo della reward Bézier: {e}")
@@ -924,40 +923,27 @@ class DuckieRLWrapper(gym.Env):
                 # info_extra = {"wrong angle": True} 
             # return reward  # ritorna il reward calcolato finora
 
-        if self.goal_center is not None:
-            if (self.prev_dist_to_goal - dist_norm) <=0:
-                reward -= 3.0 # the agent stays still or it is moving away from the goal
-
-            else:
-                reward += self.prev_dist_to_goal - dist_norm
-
-            if dist_norm < 0.15:
-                reward += 1.5
-                info_extra = {"near the goal": True}
-        
+        # 1. Progressione verso il goal
+        delta_goal = self.prev_dist_to_goal - dist_norm
+        reward += delta_goal * 5.0  # amplifica per dare importanza
         self.prev_dist_to_goal = dist_norm
 
-        if (self.prev_dist_curve - dist_curve) <= 0:
-            reward = -3.0 # the agent stays still or it is moving away from the correct curve
-        else:
-            reward += dist_curve - self.prev_dist_curve
-
+        # 2. Progressione lungo la curva (qui la curva è retta, ma manteniamo per consistenza)
+        delta_curve = self.prev_dist_curve - dist_curve
+        reward += delta_curve * 3.0
         self.prev_dist_curve = dist_curve
 
-        reward += dist_curve - self.prev_dist_curve
-        self.prev_dist_curve = dist_curve
+        # 3. Penalità proporzionale per uscita corsia
+        if abs(lateral) > 0.105:
+            reward -= (abs(lateral) - 0.105) * 50.0  # proporzionale, non fisso
 
-        if lateral < -0.105 or lateral > 0.105:
-            reward -= 5.0
-            # done = True
-            # info_extra = {"out_of_lane": True}
-            # return reward
+        # 4. Penalità proporzionale per angolo fuori soglia
+        if abs(angle) > 1.0:
+            reward -= (abs(angle) - 1.0) * 20.0
 
-        if angle < -1.0 or angle > 1.0:
-            reward -= 5.0
-            # done = True
-            # info_extra = {"wrong_angle": True}
-            # return reward
+        # 5. Bonus finale per raggiungere il goal
+        if dist_norm < 0.15:
+            reward += 10.0  # molto più alto per incentivare completamento
         
         return reward
 
@@ -974,30 +960,27 @@ class DuckieRLWrapper(gym.Env):
         action_one_hot_idx = int(np.argmax(action_one_hot))
         action = self.action_types[action_one_hot_idx]
 
-        reward = 0.0
-        # reward -= abs(lateral)/ self.max_offset
-
-        if (self.prev_dist_to_goal - dist_norm) <=0:
-            reward -= 3.0 # the agent stays still or it is moving away from the goal
-
-        else:
-            reward += self.prev_dist_to_goal - dist_norm
-        
+        # 1. Progresso verso il goal
+        delta_goal = self.prev_dist_to_goal - dist_norm
+        reward += delta_goal * 5.0
         self.prev_dist_to_goal = dist_norm
 
-        if (self.prev_dist_curve - dist_curve) <= 0:
-            reward = -3.0 # the agent stays still or it is moving away from the correct curve
-        else:
-            reward += dist_curve - self.prev_dist_curve
-
+        # 2. Progresso lungo la curva (più importante in curva che nel rettilineo)
+        delta_curve = self.prev_dist_curve - dist_curve
+        reward += delta_curve * 8.0  # più peso perché seguire la curva è cruciale
         self.prev_dist_curve = dist_curve
 
-            # Eventualmente penalizza
-            # reward -= 1.0
+        # 3. Penalità per offset laterale (proporzionale)
+        if abs(lateral) > 0.105:
+            reward -= (abs(lateral) - 0.105) * 50.0
 
+        # 4. Penalità per angolo sbagliato (proporzionale)
+        if abs(angle) > 1.0:
+            reward -= (abs(angle) - 1.0) * 20.0
+
+        # 5. Bonus se molto vicino al goal
         if dist_norm < 0.15:
-            reward += 1.5
-            info_extra = {"near the goal": True}
+            reward += 10.0
 
         return reward
     
@@ -1007,20 +990,25 @@ class DuckieRLWrapper(gym.Env):
         action_one_hot = obs[8:]
         reward = 0.0
 
-        if (self.prev_dist_to_goal - dist_norm) <=0:
-            reward -= 3.0 # the agent stays still or it is moving away from the goal
-
-        else:
-            reward += self.prev_dist_to_goal - dist_norm
-        
+        # 1. Progressione verso il goal
+        delta_goal = self.prev_dist_to_goal - dist_norm
+        reward += delta_goal * 5.0  # amplifica il segnale
         self.prev_dist_to_goal = dist_norm
 
-        if (self.prev_dist_curve - dist_curve) <= 0:
-            reward = -3.0 # the agent stays still or it is moving away from the correct curve
-        else:
-            reward += dist_curve - self.prev_dist_curve
-
+        # 2. Progressione lungo la curva Bézier
+        delta_curve = self.prev_dist_curve - dist_curve
+        reward += delta_curve * 3.0  # peso minore ma comunque significativo
         self.prev_dist_curve = dist_curve
+
+        # 3. Penalità se si allontana dalla curva
+        if delta_curve < 0:
+            reward += delta_curve * 6.0  # penalizza di più se peggiora
+            # (ma non hard reset, solo proporzionale)
+
+        # 4. Bonus finale se è molto vicino al goal
+        if dist_norm < 0.15:
+            reward += 4.0  # premio grosso per completamento
+            info_extra = {"near the goal": True}
 
         # Controlla se la curva è valida
         # if self.current_target_curve is None:
@@ -1055,9 +1043,6 @@ class DuckieRLWrapper(gym.Env):
             # print(f"[ERROR] Errore nel calcolo della reward Bézier: {e}")
             # Eventualmente penalizza
         
-        if dist_norm < 0.15:
-            reward += 1.5
-            info_extra = {"near the goal": True}
         return reward
 
     def compute_reward(self, action, obs):
@@ -1165,7 +1150,7 @@ def main():
             camera_rand=False,
             dynamics_rand=False,
             randomize_maps_on_reset=False,
-            user_tile_start= (1,2),
+            # user_tile_start= (1,2),
   
         )
 
