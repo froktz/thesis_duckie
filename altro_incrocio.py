@@ -826,8 +826,6 @@ class DuckieRLWrapper(gym.Env):
             # Normalizza rispetto alla metà della corsia
             self.normalized_dist = min_dist / (self.lane_width / 2.0)
 
-            print (f"distance from the trajectory {self.normalized_dist}")
-
         except Exception as e:
             print(f"[ERROR] Errore nel calcolo della reward Bézier: {e}")
             # Eventualmente penalizza
